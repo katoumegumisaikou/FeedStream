@@ -1,0 +1,106 @@
+# ============================================================
+# OMC 运行时状态(per-project 操作产物,不入版本控制)
+# ============================================================
+/.omc
+
+# ============================================================
+# 环境变量与密钥
+# ============================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# ============================================================
+# Go 后端 (backend/)
+# ============================================================
+# 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# 测试二进制与覆盖率文件
+*.test
+*.out
+coverage.out
+coverage.html
+profile.out
+
+# 构建输出目录
+bin/
+dist/
+
+# Go workspace(未使用 workspace 特性时启用)
+# go.work.sum
+
+# 依赖目录(仅在使用 go mod vendor 时启用)
+# vendor/
+
+# ============================================================
+# React / TypeScript 前端 (frontend/)
+# ============================================================
+node_modules/
+.pnp
+.pnp.js
+
+# 构建输出
+dist/
+build/
+out/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
+
+# 缓存
+.cache/
+.parcel-cache/
+.turbo/
+.tsbuildinfo
+*.tsbuildinfo
+
+# 测试与覆盖率
+coverage/
+.nyc_output/
+
+# 日志
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+*.log
+
+# 杂项
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# IDE / 编辑器
+# ============================================================
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.example
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ============================================================
+# 操作系统
+# ============================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+[Tt]humbs.db
+desktop.ini
