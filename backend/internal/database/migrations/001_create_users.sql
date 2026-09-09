@@ -3,7 +3,7 @@
 CREATE TABLE users (
     id            BIGSERIAL PRIMARY KEY,
     user_name     VARCHAR(64)  NOT NULL,
-    password      VARCHAR(16)  NOT NULL,
+    password      VARCHAR(64)  NOT NULL,
     phone         VARCHAR(20)  NOT NULL UNIQUE,
     email         VARCHAR(128) UNIQUE,
     avatar_url    VARCHAR(512),

@@ -22,6 +22,12 @@ type Config struct {
 }
 
 // LoadConfigFromEnv 从环境变量加载数据库配置,带默认值
+//
+// TODO(后续重构): 改为从配置文件(config.yaml / config.json)加载
+// 优先级策略待定,常见两种:
+//   - 方案 A: 配置文件提供默认值,环境变量覆盖(12-factor app 推荐)
+//   - 方案 B: 环境变量提供默认值,配置文件覆盖
+// 选定方案后统一调整此处与 main.go 启动流程。
 func LoadConfigFromEnv() Config {
 	return Config{
 		Host:     getEnv("DB_HOST", "localhost"),
