@@ -51,6 +51,7 @@ node_modules/
 
 # 构建输出
 dist/
+dist-ssr/
 build/
 out/
 .next/
