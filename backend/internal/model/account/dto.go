@@ -5,7 +5,7 @@ import "time"
 // RegisterReq 用户注册请求
 type RegisterReq struct {
 	UserName string  `json:"user_name" binding:"required,min=3,max=32"` // 用户名(3-32 字符)
-	Password string  `json:"password" binding:"required,min=8,max=16"`  // 密码(8-64 字符)
+	Password string  `json:"password" binding:"required,min=8,max=16"`  // 密码(8-16 字符,须与 password.Strong 的 MinLen/MaxLen 保持一致)
 	Phone    string  `json:"phone" binding:"required,len=11"`           // 手机号(11 位)
 	Email    *string `json:"email,omitempty" binding:"omitempty,email"` // 邮箱(可选,需合法格式)
 }
@@ -45,9 +45,9 @@ type UserResp struct {
 // 走短信验证码流程:用户先请求发送验证码到手机,再提交验证码 + 新密码完成修改
 // 适用于"忘记旧密码"或"高敏感场景需二次验证"的场景
 type ChangePasswordReq struct {
-	Phone    string `json:"phone"            binding:"required,len=11"`  // 手机号(11 位)
-	Password string `json:"password"         binding:"required,min=8,max=16"` // 新密码(明文,后端重新 bcrypt)
-	SmsCode  string `json:"sms_code"         binding:"required,len=6"`   // 短信验证码(6 位数字)
+	Phone    string `json:"phone"            binding:"required,len=11"`      // 手机号(11 位)
+	Password string `json:"password"         binding:"required,min=8,max=16"` // 新密码(8-16 字符,后端重新 bcrypt)
+	SmsCode  string `json:"sms_code"         binding:"required,len=6"`       // 短信验证码(6 位数字)
 }
 
 // SendSmsCodeReq 发送短信验证码请求

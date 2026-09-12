@@ -52,7 +52,7 @@ export default function LoginPage() {
           label="密码"
           rules={[
             { required: true, message: '请输入密码' },
-            { min: 6, message: '密码至少 6 位' },
+            { min: 8, max: 16, message: '密码 8-16 位' },
           ]}
         >
           <Input.Password placeholder="请输入密码" />

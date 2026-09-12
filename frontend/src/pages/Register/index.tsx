@@ -8,7 +8,7 @@ import type { RegisterReq } from '../../types/auth';
 
 // 注册
 //  - user_name:字母开头,字母数字下划线,需含字母(对齐后端 username.Validate)
-//  - password:至少 6 位,字母 + 数字 + 特殊字符三类中至少两类(对齐后端 password.Strong)
+//  - password:8-16 位,字母 + 数字 + 特殊字符三类中至少两类(对齐后端 password.Strong)
 //  - phone:11 位手机号
 //  - sms_code:6 位验证码
 //  - email:可选
@@ -88,7 +88,7 @@ export default function RegisterPage() {
           label="密码"
           rules={[
             { required: true, message: '请输入密码' },
-            { min: 6, message: '至少 6 位' },
+            { min: 8, max: 16, message: '密码 8-16 位' },
             // 与后端 password.Strong 对齐(字母 + 数字 + 特殊字符 三类中至少两类)
             {
               validator: async (_, value: string) => {

@@ -73,7 +73,7 @@ export default function ForgotPasswordPage() {
           label="新密码"
           rules={[
             { required: true, message: '请输入新密码' },
-            { min: 6, message: '至少 6 位' },
+            { min: 8, max: 16, message: '密码 8-16 位' },
             {
               validator: async (_, value: string) => {
                 if (!value) return Promise.resolve();
