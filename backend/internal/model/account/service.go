@@ -165,9 +165,11 @@ func (s *AccountService) Register(ctx context.Context, req RegisterReq) (*TokenR
 	}
 
 	// 发放 token
+	// 必须带上 user.Version:DB 里 version 默认是 1(非 0),
+	// 若签发时用 0,鉴权中间件比对 claims.Version != dbVersion 会直接 401
 	return &TokenResp{
-		AccessToken:  mustSignToken(user.ID, token.DefaultAccessTTL),
-		RefreshToken: mustSignToken(user.ID, token.DefaultRefreshTTL),
+		AccessToken:  mustSignTokenWithVersion(user.ID, user.Version, token.DefaultAccessTTL),
+		RefreshToken: mustSignTokenWithVersion(user.ID, user.Version, token.DefaultRefreshTTL),
 	}, nil
 }
 
@@ -202,10 +204,10 @@ func (s *AccountService) Login(ctx context.Context, req LoginReq) (*TokenResp, e
 	// 5. 更新最后登录时间
 	_ = s.userrepo.UpdateLastLoginAt(ctx, user.ID, time.Now())
 
-	// 6. 发放 token
+	// 6. 发放 token(带上 DB 里的 version,否则中间件校验会 401)
 	return &TokenResp{
-		AccessToken:  mustSignToken(user.ID, token.DefaultAccessTTL),
-		RefreshToken: mustSignToken(user.ID, token.DefaultRefreshTTL),
+		AccessToken:  mustSignTokenWithVersion(user.ID, user.Version, token.DefaultAccessTTL),
+		RefreshToken: mustSignTokenWithVersion(user.ID, user.Version, token.DefaultRefreshTTL),
 	}, nil
 }
 
@@ -435,15 +437,7 @@ func toUserResp(u *User) *UserResp {
 	}
 }
 
-func mustSignToken(userID int64, ttl time.Duration) string {
-	t, err := token.SignToken(userID, ttl)
-	if err != nil {
-		return ""
-	}
-	return t
-}
-
-// mustSignTokenWithVersion 签发带版本号的 token(改密后用,旧 token 自动失效)
+// mustSignTokenWithVersion 签发带版本号的 token
 func mustSignTokenWithVersion(userID int64, version int64, ttl time.Duration) string {
 	t, err := token.SignTokenWithVersion(userID, version, ttl)
 	if err != nil {
