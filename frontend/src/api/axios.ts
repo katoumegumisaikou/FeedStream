@@ -1,4 +1,4 @@
-import axios, { AxiosError, type AxiosResponse } from 'axios';
+import axios, { AxiosError, type AxiosRequestConfig, type AxiosResponse } from 'axios';
 import type { MessageInstance } from 'antd/es/message/interface';
 import type { ApiResp } from '../types/auth';
 
@@ -45,5 +45,16 @@ http.interceptors.response.use(
     return Promise.reject(err);
   },
 );
+
+// request 发起请求,直接返回业务数据 T
+//
+// 为什么要包一层强转:
+//   axios 拦截器的类型签名是 (value: T) => T | Promise<T>,要求"进什么类型出什么类型";
+//   而本模块的拦截器把 {code, msg, data} 解包了,实际返回的是 data,与 AxiosResponse 不同。
+//   把 as 强转收拢在这一个函数里,调用方(api/*.ts)就能拿到诚实的类型 T,
+//   避免"类型说是 AxiosResponse、运行时其实是业务数据"的错位扩散到各处。
+export function request<T>(config: AxiosRequestConfig): Promise<T> {
+  return http.request(config) as unknown as Promise<T>;
+}
 
 export default http;
