@@ -4,32 +4,51 @@ package password
 import (
 	"fmt"
 	"unicode"
-	"unicode/utf8"
 
 	"golang.org/x/crypto/bcrypt"
 )
 
 // 密码长度区间
 // ⚠️ 必须与 dto.go 里 RegisterReq / ChangePasswordReq 的 binding tag 保持一致
-// (gin 的 validator 对字符串按「字符数」计,所以这里也用 RuneCount 而非 len)
 const (
 	MinLen = 8
 	MaxLen = 16
 )
 
+// 密码允许的字符范围:ASCII 可打印字符,排除空格(0x20)
+// 排除空格是为了避免首尾空格导致的「我明明输对了」类问题
+const (
+	asciiMin = 0x21 // '!'
+	asciiMax = 0x7E // '~'
+)
+
 // Strong 校验密码强度
 // 要求:
+//   - 只允许 ASCII 可打印字符(不支持中文、空格等)
 //   - 长度 8-16(与 dto.go 的 binding 一致)
 //   - 字母、数字、特殊字符 三者中至少满足两类
 //
+// 限制 ASCII 的原因:规避 Unicode 归一化问题。
+// 同一个「é」在不同平台可能是 NFC(U+00E9,2 字节)或 NFD(e + U+0301,3 字节),
+// 肉眼完全一样但字节不同,bcrypt 按字节比对 → 用户会遇到「密码明明输对了却登不进去」,
+// 且无从排查。另外零宽字符、输入法差异等也会带来同类问题。
+//
 // 返回 (是否通过, 失败原因)。调用方根据失败原因返回不同的业务错误。
 func Strong(pwd string) (bool, string) {
-	// 1. 长度校验(按字符数,与 gin validator 的口径一致)
-	if n := utf8.RuneCountInString(pwd); n < MinLen || n > MaxLen {
+	// 1. 字符集校验(放最前,让用了中文的用户一次就看到真正原因)
+	for _, r := range pwd {
+		if r < asciiMin || r > asciiMax {
+			return false, "密码只能使用字母、数字和常见符号(不支持中文、空格等)"
+		}
+	}
+
+	// 2. 长度校验
+	// 上面已确保全是 ASCII,此时字符数 == 字节数,直接用 len() 即可
+	if n := len(pwd); n < MinLen || n > MaxLen {
 		return false, fmt.Sprintf("密码长度必须为 %d-%d 位", MinLen, MaxLen)
 	}
 
-	// 2. 统计字符种类
+	// 3. 统计字符种类
 	var hasLetter, hasDigit, hasSpecial bool
 	for _, r := range pwd {
 		switch {

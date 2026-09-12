@@ -77,6 +77,10 @@ export default function ForgotPasswordPage() {
             {
               validator: async (_, value: string) => {
                 if (!value) return Promise.resolve();
+                // 与后端 password.Strong 对齐:只允许 ASCII 可打印字符(排除空格)
+                if (!/^[\x21-\x7E]+$/.test(value)) {
+                  return Promise.reject(new Error('密码只能使用字母、数字和常见符号'));
+                }
                 const types = [/[a-zA-Z]/.test(value), /\d/.test(value), /[^a-zA-Z0-9]/.test(value)];
                 const cnt = types.filter(Boolean).length;
                 return cnt >= 2 ? Promise.resolve() : Promise.reject(new Error('需含字母、数字、特殊字符中的至少两类'));
