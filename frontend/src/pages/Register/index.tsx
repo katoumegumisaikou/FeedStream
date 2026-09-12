@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Form, Input, Button, message, Space } from 'antd';
+import { App, Form, Input, Button, Space } from 'antd';
 import { Link, useNavigate as useRouterNavigate } from 'react-router-dom';
 import AuthLayout from '../../layouts/AuthLayout';
 import SmsCodeButton from '../../components/SmsCodeButton';
@@ -16,6 +16,7 @@ export default function RegisterPage() {
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm<RegisterReq>();
   const router = useRouterNavigate();
+  const { message } = App.useApp();
 
   const onFinish = async (values: RegisterReq) => {
     setLoading(true);

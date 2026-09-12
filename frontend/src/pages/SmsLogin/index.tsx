@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Form, Input, Button, message, Space } from 'antd';
+import { App, Form, Input, Button, Space } from 'antd';
 import { Link, useNavigate as useRouterNavigate } from 'react-router-dom';
 import AuthLayout from '../../layouts/AuthLayout';
 import SmsCodeButton from '../../components/SmsCodeButton';
@@ -13,6 +13,7 @@ export default function SmsLoginPage() {
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm<SmsLoginReq>();
   const router = useRouterNavigate();
+  const { message } = App.useApp();
 
   const onFinish = async (values: SmsLoginReq) => {
     setLoading(true);
@@ -68,7 +69,7 @@ export default function SmsLoginPage() {
         </Form.Item>
 
         <Form.Item>
-          <Button type="primary" htmlType="submit" loading={loading} block>
+          <Button type="primary" htmlType="submit" loading={loading}  block>
             登录
           </Button>
         </Form.Item>

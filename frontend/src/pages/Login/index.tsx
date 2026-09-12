@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Form, Input, Button, Divider, message } from 'antd';
+import { App, Form, Input, Button, Divider } from 'antd';
 import { Link, useNavigate as useRouterNavigate } from 'react-router-dom';
 import AuthLayout from '../../layouts/AuthLayout';
 import { login } from '../../api/auth';
@@ -13,6 +13,7 @@ export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm<LoginReq>();
   const router = useRouterNavigate();
+  const { message } = App.useApp();
 
   const onFinish = async (values: LoginReq) => {
     setLoading(true);
