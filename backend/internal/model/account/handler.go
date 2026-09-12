@@ -5,6 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"feed-system/internal/middleware"
 	"feed-system/internal/pkg/errs"
 	"feed-system/internal/pkg/response"
 )
@@ -91,7 +92,7 @@ func (h *AccountHandler) GetProfile(c *gin.Context) {
 // GetMyProfile 获取当前登录用户资料
 // GET /api/v1/users/me
 func (h *AccountHandler) GetMyProfile(c *gin.Context) {
-	user, err := h.svc.GetProfile(c.Request.Context(), UserID(c))
+	user, err := h.svc.GetProfile(c.Request.Context(), middleware.UserID(c))
 	if err != nil {
 		response.Error(c, err)
 		return
@@ -107,7 +108,7 @@ func (h *AccountHandler) UpdateProfile(c *gin.Context) {
 		response.Error(c, errs.ErrInvalidParam)
 		return
 	}
-	user, err := h.svc.UpdateProfile(c.Request.Context(), UserID(c), req)
+	user, err := h.svc.UpdateProfile(c.Request.Context(), middleware.UserID(c), req)
 	if err != nil {
 		response.Error(c, err)
 		return

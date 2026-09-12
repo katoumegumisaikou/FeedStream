@@ -4,13 +4,15 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
+
+	"feed-system/internal/middleware"
 )
 
 // RegisterRouter 把 account 模块的所有路由挂到指定的路由组
 // 用法:account.RegisterRouter(r.Group("/api/v1"), h, db, rdb)
 //
-// Auth 中间件定义在 account 包内,只依赖 gorm + redis,不依赖任何外部中间件包
-// 这样 account/router.go 不需要 import middleware,避免循环引用
+// Auth 中间件在 internal/middleware 包,只依赖 gorm + redis,不依赖任何业务包,
+// 因此 account → middleware 是单向依赖,不会有循环引用
 func RegisterRouter(rg *gin.RouterGroup, h *AccountHandler, db *gorm.DB, rdb *redis.Client) {
 	// ========== 公开路由(无需登录) ==========
 	auth := rg.Group("/auth")
@@ -30,7 +32,7 @@ func RegisterRouter(rg *gin.RouterGroup, h *AccountHandler, db *gorm.DB, rdb *re
 	}
 
 	// ========== 私有路由(需要登录,Auth 中间件校验 token + version) ==========
-	priv := rg.Group("/users", Auth(db, rdb))
+	priv := rg.Group("/users", middleware.Auth(db, rdb))
 	{
 		priv.GET("/me", h.GetMyProfile)
 		priv.PUT("/me", h.UpdateProfile)

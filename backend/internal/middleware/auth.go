@@ -1,5 +1,8 @@
-// Package account 中的 Auth 中间件
-package account
+// Package middleware 存放 gin 中间件
+//
+// 中间件只依赖 gorm / redis / pkg 层工具,不依赖任何业务包,
+// 避免与 model 层形成循环引用。
+package middleware
 
 import (
 	"errors"
@@ -15,9 +18,9 @@ import (
 )
 
 const (
-	userIDKey      = "userID"
-	usersTable     = "users"
-	versionCol     = "version"
+	userIDKey       = "userID"
+	usersTable      = "users"
+	versionCol      = "version"
 	versionCacheTTL = 5 * time.Minute
 )
 
