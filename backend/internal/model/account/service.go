@@ -14,6 +14,7 @@ import (
 
 	"feed-system/internal/pkg/errs"
 	"feed-system/internal/pkg/token"
+	"feed-system/internal/util/filetype"
 	"feed-system/internal/util/password"
 	"feed-system/internal/util/username"
 
@@ -483,13 +484,46 @@ const AvatarURLPrefix = "/avatars"
 // AvatarStorageDir 头像在磁盘上的存储根目录(换机器/进容器会失效,应改为配置)
 const AvatarStorageDir = "/home/megumi/gocodehub/feed_system/avatars"
 
-func (s *AccountService) UploadAvatar(ctx context.Context, fileheader *multipart.FileHeader, userID int64, ext string) error {
+// 头像文件大小上限:10 MiB
+const maxAvatarSize = 10 << 20
+
+// 允许的头像格式白名单(魔数判定后使用)
+var allowedAvatarMIME = map[string]bool{
+	filetype.MIMEJPEG: true,
+	filetype.MIMEPNG:  true,
+	filetype.MIMEGIF:  true,
+	filetype.MIMEWebP: true,
+}
+
+func (s *AccountService) UploadAvatar(ctx context.Context, fileheader *multipart.FileHeader, userID int64) error {
+	if fileheader.Size <= 0 || fileheader.Size > maxAvatarSize {
+		return errs.ErrInvalidParam.WithMsg("头像文件不能为空,且大小不能超过 10MB")
+	}
+
 	multiFile, err := fileheader.Open()
 	if err != nil {
-		slog.ErrorContext(ctx, "打开上传文件失败", "user_id", userID, "err", err)
-		return err
+		return errs.ErrInternal.WithMsg("读取上传文件失败")
 	}
 	defer multiFile.Close()
+
+	// 后缀和 Content-Type 都由客户端提供,只能用文件头魔数判断真实类型。
+	header := make([]byte, filetype.HeaderSize)
+	n, readErr := io.ReadFull(multiFile, header)
+	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		return errs.ErrInternal.WithMsg("读取上传文件失败")
+	}
+	mime, ok := filetype.DetectImage(header[:n])
+	if !ok || !allowedAvatarMIME[mime] {
+		return errs.ErrInvalidParam.WithMsg("头像只支持 JPG / PNG / GIF / WebP 格式")
+	}
+	ext, ok := filetype.ExtForMIME(mime)
+	if !ok {
+		return errs.ErrInvalidParam.WithMsg("头像只支持 JPG / PNG / GIF / WebP 格式")
+	}
+	// 魔数读取移动了文件偏移,保存前必须回到文件开头,否则会丢失前 12 字节。
+	if _, err := multiFile.Seek(0, io.SeekStart); err != nil {
+		return errs.ErrInternal.WithMsg("读取上传文件失败")
+	}
 
 	// 权限 0o755:属主可读写执行,其他人可读可执行 ——
 	// 目录必须带 x 位才能被进入,不能用 0o644

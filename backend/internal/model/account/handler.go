@@ -1,7 +1,6 @@
 package account
 
 import (
-	"io"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -9,7 +8,6 @@ import (
 	"feed-system/internal/middleware"
 	"feed-system/internal/pkg/errs"
 	"feed-system/internal/pkg/response"
-	"feed-system/internal/util/filetype"
 )
 
 // AccountHandler 用户账号 HTTP handler
@@ -174,19 +172,6 @@ func (h *AccountHandler) Refresh(c *gin.Context) {
 	response.OK(c, nil) // 新 token 已在 cookie 里,body 不需要重复
 }
 
-// 头像文件大小上限:10 MiB
-// 用位运算 10 << 20 而不是 10 * 1000 * 1000 —— 文件大小惯例按 1024 进制
-const maxAvatarSize = 10 << 20 // 10485760 字节
-
-// 允许的头像格式白名单(魔数判定后用)
-// 不含 BMP:它只有 2 字节魔数、判别力弱,且头像场景用不到
-var allowedAvatarMIME = map[string]bool{
-	filetype.MIMEJPEG: true,
-	filetype.MIMEPNG:  true,
-	filetype.MIMEGIF:  true,
-	filetype.MIMEWebP: true,
-}
-
 func (h *AccountHandler) UploadAvatar(c *gin.Context) {
 	// 必须用 middleware.UserID:它读的 key 是 "userID"(驼峰),
 	// 手写 c.GetInt64("user_id") 会取不到值,恒为 0 → 永远 401
@@ -203,40 +188,7 @@ func (h *AccountHandler) UploadAvatar(c *gin.Context) {
 		return
 	}
 
-	if fileheader.Size <= 0 || fileheader.Size > maxAvatarSize {
-		response.Error(c, errs.ErrInvalidParam.WithMsg("头像文件不能为空,且大小不能超过 10MB"))
-		return
-	}
-
-	// 魔数校验:读文件头判断真实类型
-	// 后缀和 Content-Type 都由客户端提供、均可伪造,只有文件头字节来自文件本身
-	f, err := fileheader.Open()
-	if err != nil {
-		response.Error(c, errs.ErrInternal.WithMsg("读取上传文件失败"))
-		return
-	}
-	defer f.Close()
-
-	header := make([]byte, filetype.HeaderSize)
-	// 文件不足 HeaderSize 字节时 n < len(header),
-	// DetectImage 会因匹配失败返回 false(不会误判为合法图片)
-	n, _ := io.ReadFull(f, header)
-
-	mime, ok := filetype.DetectImage(header[:n])
-	if !ok || !allowedAvatarMIME[mime] {
-		response.Error(c, errs.ErrInvalidParam.WithMsg("头像只支持 JPG / PNG / GIF / WebP 格式"))
-		return
-	}
-
-	// 后缀从魔数结果推导,不用 fileheader.Filename:后者客户端可控,
-	// 传 evil.html 会被存成 .html,静态伺服时造成 XSS
-	ext, ok := filetype.ExtForMIME(mime)
-	if !ok {
-		response.Error(c, errs.ErrInvalidParam.WithMsg("头像只支持 JPG / PNG / GIF / WebP 格式"))
-		return
-	}
-
-	if err := h.svc.UploadAvatar(c.Request.Context(), fileheader, userID, ext); err != nil {
+	if err := h.svc.UploadAvatar(c.Request.Context(), fileheader, userID); err != nil {
 		response.Error(c, err)
 		return
 	}
