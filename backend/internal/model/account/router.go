@@ -32,7 +32,7 @@ func RegisterRouter(rg *gin.RouterGroup, h *AccountHandler, db *gorm.DB, rdb *re
 	}
 
 	// ========== 私有路由(需要登录,Auth 中间件校验 token + version) ==========
-	priv := rg.Group("/users", middleware.Auth(db, rdb))
+	priv := rg.Group("/users", middleware.SetSensitive(), middleware.Auth(db, rdb))
 	{
 		priv.GET("/me", h.GetMyProfile)
 		priv.PUT("/me", h.UpdateProfile)

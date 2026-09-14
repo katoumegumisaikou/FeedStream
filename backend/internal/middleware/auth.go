@@ -24,6 +24,13 @@ const (
 	versionCacheTTL = 5 * time.Minute
 )
 
+// SetSensitive 将当前路由标记为强制登录，需与 Auth 一起使用。
+func SetSensitive() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Set("sensitive", true)
+	}
+}
+
 // Auth 用户鉴权中间件
 // 用法:router.GET("/api/v1/users/me", middleware.Auth(db, rdb), handler.GetMyProfile)
 //
@@ -39,8 +46,14 @@ const (
 func Auth(db *gorm.DB, rdb *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenStr := readToken(c)
-		if tokenStr == "" {
+		sensitive := c.GetBool("sensitive")
+		if sensitive && tokenStr == "" {
+			// 强鉴权
 			abortUnauthorized(c, "未登录")
+			return
+		} else if !sensitive && tokenStr == "" {
+			// 软鉴权
+			c.Next()
 			return
 		}
 		claims, err := token.Parse(tokenStr)
@@ -48,10 +61,11 @@ func Auth(db *gorm.DB, rdb *redis.Client) gin.HandlerFunc {
 			abortUnauthorized(c, "token 无效或已过期")
 			return
 		}
-		c.Set(userIDKey, claims.UserID)
+
 		if !checkUserVersion(c, db, rdb, claims.UserID, claims.Version) {
 			return
 		}
+		c.Set(userIDKey, claims.UserID)
 		c.Next()
 	}
 }
