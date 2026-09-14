@@ -7,6 +7,7 @@ import type {
   SendSmsCodeReq,
   SendSmsCodeResp,
   SmsLoginReq,
+  UserResp,
 } from '../types/auth';
 
 // 所有账号相关 API,路径对齐 backend/internal/model/account/router.go
@@ -35,6 +36,11 @@ export function smsLogin(req: SmsLoginReq): Promise<LoginSuccessResp> {
 // POST /auth/logout 登出(后端从 cookie 读 token)
 export function logout(): Promise<{ logged_out: boolean }> {
   return request<{ logged_out: boolean }>({ url: '/auth/logout', method: 'post' });
+}
+
+// GET /users/me 取当前登录用户资料(需登录,token 由 cookie 携带)
+export function getMyProfile(): Promise<UserResp> {
+  return request<UserResp>({ url: '/users/me', method: 'get' });
 }
 
 // POST /auth/sms-code 发送短信验证码

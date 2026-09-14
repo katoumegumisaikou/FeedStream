@@ -49,6 +49,19 @@ export interface LoginSuccessResp {
   logged_in: boolean;
 }
 
+// 当前登录用户资料(后端 UserResp,见 backend/internal/model/account/dto.go)
+// 注意:Go 侧 Email / AvatarURL / LastLoginAt 带 omitempty,
+//      值为空时这几个字段会整个从 JSON 里消失,所以 TS 用可选
+export interface UserResp {
+  id: number;
+  user_name: string;
+  phone: string;
+  email?: string;
+  avatar_url?: string;
+  created_at: string; // ISO 8601 UTC,如 "2026-09-12T16:50:53.025052Z"
+  last_login_at?: string;
+}
+
 // 后端错误码常量(对应 errs.ServiceErr.Code)
 export const ErrCode = {
   InvalidParam: 40001,
