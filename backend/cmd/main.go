@@ -16,6 +16,7 @@ import (
 
 	"feed-system/internal/database"
 	"feed-system/internal/model/account"
+	"feed-system/internal/pkg/logger"
 )
 
 // getEnv 读环境变量,带默认值
@@ -43,6 +44,13 @@ func getEnvBool(key string, fallback bool) bool {
 
 // main 启动入口
 func main() {
+	// 0. 初始化日志:后续所有输出(含标准库 log)都写入文件
+	closeLog, err := logger.Init(getEnv("LOG_FILE", "logs/app.log"))
+	if err != nil {
+		log.Fatalf("初始化日志失败: %v", err)
+	}
+	defer closeLog()
+
 	// 1. 加载数据库配置
 	cfg := database.LoadConfigFromEnv()
 
@@ -76,6 +84,9 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
+	// 头像公开访问: /avatars/{userID}/{fileName}
+	// 仅暴露头像存储目录,不暴露项目或其他本地文件。
+	r.Static(account.AvatarURLPrefix, account.AvatarStorageDir)
 
 	// 7. 注册 account 路由(/api/v1/...)
 	v1 := r.Group("/api/v1")

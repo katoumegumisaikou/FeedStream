@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	userIDKey       = "userID"
+	userIDKey       = "user_id"
 	usersTable      = "users"
 	versionCol      = "version"
 	versionCacheTTL = 5 * time.Minute

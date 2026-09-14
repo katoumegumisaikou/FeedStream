@@ -31,6 +31,9 @@ type UserRepository interface {
 	// UpdateLastLoginAt 仅更新最近登录时间(避免全字段写)
 	UpdateLastLoginAt(ctx context.Context, id int64, t time.Time) error
 
+	// UpdateAvatarURL 仅更新头像 URL(避免全字段写)
+	UpdateAvatarURL(ctx context.Context, id int64, url string) error
+
 	// Delete 软删除(底层为 UPDATE deleted_at)
 	Delete(ctx context.Context, id int64) error
 }
@@ -121,6 +124,14 @@ func (r *userRepository) UpdateLastLoginAt(ctx context.Context, id int64, t time
 		Model(&User{}).
 		Where("id = ?", id).
 		Update("last_login_at", t).Error
+}
+
+// UpdateAvatarURL 实现 UserRepository.UpdateAvatarURL
+func (r *userRepository) UpdateAvatarURL(ctx context.Context, id int64, url string) error {
+	return r.db.WithContext(ctx).
+		Model(&User{}).
+		Where("id = ?", id).
+		Update("avatar_url", url).Error
 }
 
 // Delete 实现 UserRepository.Delete(软删除)

@@ -44,6 +44,15 @@ profile.out
 bin/
 dist/
 
+# 运行时产物:日志(含 logrotate 轮转出来的 .log.1 / .log.gz)
+# 目录整体忽略,比只靠上面的 *.log 更稳妥
+logs/
+*.log.*
+
+# 运行时产物:用户上传的头像(保留目录,不提交头像文件)
+avatars/*
+!avatars/.gitkeep
+
 # Go workspace(未使用 workspace 特性时启用)
 # go.work.sum
 

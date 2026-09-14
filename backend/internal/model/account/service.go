@@ -4,7 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/rand"
+	"mime/multipart"
+	"os"
+	"path/filepath"
 	"time"
 
 	"feed-system/internal/pkg/errs"
@@ -12,6 +17,7 @@ import (
 	"feed-system/internal/util/password"
 	"feed-system/internal/util/username"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -19,8 +25,8 @@ import (
 // 依赖 UserRepository 接口,不直接耦合 GORM,便于测试和替换实现
 type AccountService struct {
 	userrepo UserRepository
-	rdb      *redis.Client      // 可选,nil 时跳过登录失败锁定
-	devMode  bool                // dev 模式:短信验证码直接返回到响应(仅测试用)
+	rdb      *redis.Client // 可选,nil 时跳过登录失败锁定
+	devMode  bool          // dev 模式:短信验证码直接返回到响应(仅测试用)
 }
 
 // NewAccountService 构造 AccountService
@@ -321,11 +327,11 @@ func (s *AccountService) verifySmsCode(ctx context.Context, phone, code string) 
 
 // RefreshToken 用 refresh_token 换新 token
 // 流程:
-//   1. 解析 refresh_token → 拿 claims(userID, version, exp)
-//   2. 查 Redis:refresh_token 是否在黑名单(已用过的)
-//   4. 查 DB: user.Version 是否匹配(防改密后旧 refresh)
-//   5. 用过的旧 refresh_token 加入黑名单(防重放)
-//   6. 用当前 Version 签发新 access_token + refresh_token
+//  1. 解析 refresh_token → 拿 claims(userID, version, exp)
+//  2. 查 Redis:refresh_token 是否在黑名单(已用过的)
+//  4. 查 DB: user.Version 是否匹配(防改密后旧 refresh)
+//  5. 用过的旧 refresh_token 加入黑名单(防重放)
+//  6. 用当前 Version 签发新 access_token + refresh_token
 func (s *AccountService) RefreshToken(ctx context.Context, refreshToken string) (*TokenResp, error) {
 	if refreshToken == "" {
 		return nil, errs.ErrUnauthorized.WithMsg("refresh_token 缺失")
@@ -457,4 +463,72 @@ func (s *AccountService) CheckUserVersion(ctx context.Context, userID int64) (in
 		return 0, errs.ErrInternal.WithMsg("查询用户失败")
 	}
 	return user.Version, nil
+}
+
+// newFileName 生成随机文件名(不含扩展名),调用方自行拼接后缀。
+//
+// 不能用 fileheader.Filename:客户端可控,可含 "../" 造成路径穿越,
+// 也可带 .php/.html 后缀,被静态伺服时造成 XSS。
+//
+// 用 UUID v4(crypto/rand)而非 math/rand —— 后者输出可被反推,
+// 攻击者能据此预测出他人的文件名并遍历下载。
+func newFileName() string {
+	return uuid.NewString()
+}
+
+// AvatarURLPrefix 头像对外 URL 前缀,由 main.go 的静态路由挂载。
+// 必须与 AvatarStorageDir 对应,否则写进库的 URL 会 404
+const AvatarURLPrefix = "/avatars"
+
+// AvatarStorageDir 头像在磁盘上的存储根目录(换机器/进容器会失效,应改为配置)
+const AvatarStorageDir = "/home/megumi/gocodehub/feed_system/avatars"
+
+func (s *AccountService) UploadAvatar(ctx context.Context, fileheader *multipart.FileHeader, userID int64, ext string) error {
+	multiFile, err := fileheader.Open()
+	if err != nil {
+		slog.ErrorContext(ctx, "打开上传文件失败", "user_id", userID, "err", err)
+		return err
+	}
+	defer multiFile.Close()
+
+	// 权限 0o755:属主可读写执行,其他人可读可执行 ——
+	// 目录必须带 x 位才能被进入,不能用 0o644
+	dir := filepath.Join(AvatarStorageDir, fmt.Sprintf("%d", userID))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		slog.ErrorContext(ctx, "创建头像目录失败", "user_id", userID, "dir", dir, "err", err)
+		return err
+	}
+
+	// ext 由 handler 从魔数检测结果推导后传入,不用 fileheader.Filename(客户端可伪造)
+	fileName := newFileName() + ext
+	filePath := filepath.Join(dir, fileName)
+
+	osFile, err := os.Create(filePath)
+	if err != nil {
+		slog.ErrorContext(ctx, "创建头像文件失败", "user_id", userID, "path", filePath, "err", err)
+		return err
+	}
+	// Close 的错误单独记:写入型文件的 close 可能携带延迟写入的错误
+	// (NFS、ext4 延迟分配下的 ENOSPC),不能吞掉
+	defer func() {
+		if cerr := osFile.Close(); cerr != nil {
+			slog.ErrorContext(ctx, "关闭头像文件失败", "user_id", userID, "path", filePath, "err", cerr)
+		}
+	}()
+
+	if _, err := io.Copy(osFile, multiFile); err != nil {
+		_ = os.Remove(filePath) // 写盘失败,清掉半个文件
+		slog.ErrorContext(ctx, "写入头像文件失败", "user_id", userID, "path", filePath, "err", err)
+		return err
+	}
+
+	// 写库:存对外 URL(相对路径,前端同源访问;生产由 Nginx 反代到存储目录)
+	avatarURL := fmt.Sprintf("%s/%d/%s", AvatarURLPrefix, userID, fileName)
+	if err := s.userrepo.UpdateAvatarURL(ctx, userID, avatarURL); err != nil {
+		_ = os.Remove(filePath) // 写库失败,删掉刚存的文件,避免留下孤儿
+		slog.ErrorContext(ctx, "更新头像 URL 失败", "user_id", userID, "path", filePath, "err", err)
+		return err
+	}
+
+	return nil
 }

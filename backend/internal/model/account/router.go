@@ -36,5 +36,6 @@ func RegisterRouter(rg *gin.RouterGroup, h *AccountHandler, db *gorm.DB, rdb *re
 	{
 		priv.GET("/me", h.GetMyProfile)
 		priv.PUT("/me", h.UpdateProfile)
+		priv.POST("/me/avatar", h.UploadAvatar)
 	}
 }
