@@ -49,7 +49,7 @@ export interface LoginSuccessResp {
   logged_in: boolean;
 }
 
-// 当前登录用户资料(后端 UserResp,见 backend/internal/model/account/dto.go)
+// 当前登录用户资料(GET /users/me,后端 UserResp,见 backend/internal/model/account/dto.go)
 // 注意:Go 侧 Email / AvatarURL / LastLoginAt 带 omitempty,
 //      值为空时这几个字段会整个从 JSON 里消失,所以 TS 用可选
 export interface UserResp {
@@ -60,6 +60,15 @@ export interface UserResp {
   avatar_url?: string;
   created_at: string; // ISO 8601 UTC,如 "2026-09-12T16:50:53.025052Z"
   last_login_at?: string;
+}
+
+// 他人公开资料(GET /users/:id,后端 PublicUserResp)
+// 不含 phone / email / last_login_at —— 后端在这条路径上不会返回联系方式
+export interface PublicUserResp {
+  id: number;
+  user_name: string;
+  avatar_url?: string;
+  created_at: string;
 }
 
 // 后端错误码常量(对应 errs.ServiceErr.Code)

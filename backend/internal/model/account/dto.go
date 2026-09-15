@@ -41,6 +41,17 @@ type UserResp struct {
 	LastLoginAt *time.Time `json:"last_login_at,omitempty"` // 最近登录时间(可空)
 }
 
+// PublicUserResp 公开资料视图(查他人资料用)
+//
+// 与 UserResp 的区别:不含 Phone / Email / LastLoginAt。
+// 联系方式自不必说;LastLoginAt 也是隐私 —— 能据此推断用户的活跃时段和作息。
+type PublicUserResp struct {
+	ID        int64     `json:"id"`                   // 主键 ID
+	UserName  string    `json:"user_name"`            // 用户名
+	AvatarURL string    `json:"avatar_url,omitempty"` // 头像 URL(可空)
+	CreatedAt time.Time `json:"created_at"`           // 注册时间
+}
+
 // ChangePasswordReq 修改密码请求
 // 走短信验证码流程:用户先请求发送验证码到手机,再提交验证码 + 新密码完成修改
 // 适用于"忘记旧密码"或"高敏感场景需二次验证"的场景

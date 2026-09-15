@@ -26,6 +26,8 @@ func RegisterRouter(rg *gin.RouterGroup, h *AccountHandler, db *gorm.DB, rdb *re
 	}
 
 	// ========== 公开路由(查他人资料,无需登录) ==========
+	// 游客点开作者主页不该被要求登录。安全性由 DTO 兜底:
+	// GetProfile 只返回 PublicUserResp,不含手机号 / 邮箱 / 最近登录时间
 	users := rg.Group("/users")
 	{
 		users.GET("/:id", h.GetProfile)

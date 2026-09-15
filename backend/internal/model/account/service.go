@@ -38,27 +38,34 @@ func NewAccountService(userrepo UserRepository, rdb *redis.Client, devMode bool)
 
 // ============================================================
 // 登录失败锁定(Redis 版)
-// 连续失败 N 次后,按指数退避锁定:BaseTTL * 2^(N-MaxAttempts),封顶 MaxTTL
+// 计数与锁定用两个独立的 key —— 计数 key 上的 TTL 只是「计数窗口」,
+// 不能当成「已锁定」,否则第一次失败就会被判成锁定
 // 登录成功后调用 reset 清除
 // ============================================================
 
 const (
 	loginLockMaxAttempts = 5
-	loginLockBaseTTL     = 60 * time.Second
+	loginLockCountWindow = 15 * time.Minute // 计数窗口:窗口内累计失败次数,到期归零
+	loginLockBaseTTL     = 60 * time.Second // 锁的基础时长
 	loginLockMaxTTL      = 24 * time.Hour
 )
 
-// loginLockKey 生成 Redis key
-func (s *AccountService) loginLockKey(phone string) string {
+// loginLockCountKey 失败计数器的 key(带计数窗口 TTL)
+func (s *AccountService) loginLockCountKey(phone string) string {
 	return "feed:fail:" + phone
 }
 
-// loginLockCheck 检查是否被锁,返回剩余 TTL(0 表示未锁)
+// loginLockFlagKey 锁定标记的 key。只有这个 key 存在才代表「已锁定」
+func (s *AccountService) loginLockFlagKey(phone string) string {
+	return "feed:fail:lock:" + phone
+}
+
+// loginLockCheck 检查是否被锁定,返回剩余时长(0 表示未锁)
 func (s *AccountService) loginLockCheck(ctx context.Context, phone string) (time.Duration, error) {
 	if s.rdb == nil {
 		return 0, nil
 	}
-	ttl, err := s.rdb.TTL(ctx, s.loginLockKey(phone)).Result()
+	ttl, err := s.rdb.TTL(ctx, s.loginLockFlagKey(phone)).Result()
 	if err != nil {
 		return 0, err
 	}
@@ -68,22 +75,22 @@ func (s *AccountService) loginLockCheck(ctx context.Context, phone string) (time
 	return ttl, nil
 }
 
-// loginLockFail 记录一次失败,达到每 5 次的倍数时锁定一次
+// loginLockFail 记录一次失败,累计到 MaxAttempts 的倍数时写锁标记
 //   - 5、10、15... 次失败 → 锁定,TTL = BaseTTL × 2^((N/5)-1)
 //   - 封顶 MaxTTL,达到封顶后不再延长
 func (s *AccountService) loginLockFail(ctx context.Context, phone string) (time.Duration, error) {
 	if s.rdb == nil {
 		return 0, nil
 	}
-	key := s.loginLockKey(phone)
-	count, err := s.rdb.Incr(ctx, key).Result()
+	countKey := s.loginLockCountKey(phone)
+	count, err := s.rdb.Incr(ctx, countKey).Result()
 	if err != nil {
 		return 0, err
 	}
 
-	// 第一次失败时设置基础 TTL,后续失败延续(给 key 一个寿命窗口)
+	// 第一次失败时开一个计数窗口,避免陈年失败被一直累加
 	if count == 1 {
-		s.rdb.Expire(ctx, key, loginLockBaseTTL)
+		s.rdb.Expire(ctx, countKey, loginLockCountWindow)
 		return 0, nil
 	}
 
@@ -101,16 +108,19 @@ func (s *AccountService) loginLockFail(ctx context.Context, phone string) (time.
 	if ttl > loginLockMaxTTL {
 		ttl = loginLockMaxTTL
 	}
-	s.rdb.Expire(ctx, key, ttl)
+	// 用 Set 而不是 Expire:一步写入并带 TTL
+	if err := s.rdb.Set(ctx, s.loginLockFlagKey(phone), 1, ttl).Err(); err != nil {
+		return 0, err
+	}
 	return ttl, nil
 }
 
-// loginLockReset 清除失败计数(登录成功后调用)
+// loginLockReset 清除失败计数与锁定标记(登录成功后调用)
 func (s *AccountService) loginLockReset(ctx context.Context, phone string) error {
 	if s.rdb == nil {
 		return nil
 	}
-	return s.rdb.Del(ctx, s.loginLockKey(phone)).Err()
+	return s.rdb.Del(ctx, s.loginLockCountKey(phone), s.loginLockFlagKey(phone)).Err()
 }
 
 // ============================================================
@@ -131,7 +141,8 @@ func (s *AccountService) Register(ctx context.Context, req RegisterReq) (*TokenR
 	// 业务校验:用户名唯一性
 	u, err := s.userrepo.FindByUserName(ctx, req.UserName)
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return nil, err
+		slog.ErrorContext(ctx, "注册失败:查询用户名出错", "err", err)
+		return nil, errs.ErrInternal.WithMsg("注册失败")
 	} else if u != nil {
 		return nil, errs.ErrConflict.WithMsg("用户名已被占用")
 	}
@@ -139,7 +150,8 @@ func (s *AccountService) Register(ctx context.Context, req RegisterReq) (*TokenR
 	// 业务校验:手机号唯一性
 	u, err = s.userrepo.FindByPhone(ctx, req.Phone)
 	if err != nil && !errors.Is(err, ErrNotFound) {
-		return nil, err
+		slog.ErrorContext(ctx, "注册失败:查询手机号出错", "err", err)
+		return nil, errs.ErrInternal.WithMsg("注册失败")
 	} else if u != nil {
 		return nil, errs.ErrConflict.WithMsg("手机号已被注册")
 	}
@@ -148,7 +160,8 @@ func (s *AccountService) Register(ctx context.Context, req RegisterReq) (*TokenR
 	if req.Email != nil {
 		u, err = s.userrepo.FindByEmail(ctx, *req.Email)
 		if err != nil && !errors.Is(err, ErrNotFound) {
-			return nil, err
+			slog.ErrorContext(ctx, "注册失败:查询邮箱出错", "err", err)
+			return nil, errs.ErrInternal.WithMsg("注册失败")
 		} else if u != nil {
 			return nil, errs.ErrConflict.WithMsg("邮箱已被注册")
 		}
@@ -157,6 +170,7 @@ func (s *AccountService) Register(ctx context.Context, req RegisterReq) (*TokenR
 	// 哈希密码(bcrypt)
 	hashed, err := password.Hash(req.Password)
 	if err != nil {
+		slog.ErrorContext(ctx, "注册失败:密码哈希出错", "err", err)
 		return nil, errs.ErrInternal.WithMsg("密码哈希失败")
 	}
 
@@ -168,6 +182,7 @@ func (s *AccountService) Register(ctx context.Context, req RegisterReq) (*TokenR
 		Email:    req.Email,
 	}
 	if err := s.userrepo.Create(ctx, user); err != nil {
+		slog.ErrorContext(ctx, "注册失败:创建用户出错", "err", err)
 		return nil, errs.ErrInternal.WithMsg("创建用户失败")
 	}
 
@@ -244,8 +259,8 @@ func (s *AccountService) Logout(ctx context.Context, accessToken, refreshToken s
 	return nil
 }
 
-// GetProfile 根据 userID 查询用户资料(返回 UserResp,过滤敏感字段)
-func (s *AccountService) GetProfile(ctx context.Context, userID int64) (*UserResp, error) {
+// findUserByID 按主键查用户,并把仓储错误翻译成业务错误
+func (s *AccountService) findUserByID(ctx context.Context, userID int64) (*User, error) {
 	user, err := s.userrepo.FindByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -253,18 +268,36 @@ func (s *AccountService) GetProfile(ctx context.Context, userID int64) (*UserRes
 		}
 		return nil, errs.ErrInternal.WithMsg("查询用户失败")
 	}
+	return user, nil
+}
+
+// GetProfile 查询他人公开资料(走 GET /users/:id)
+//
+// 只返回 PublicUserResp:登录用户可以看别人的昵称和头像,
+// 但不该顺手拿到对方的手机号、邮箱和最近登录时间
+func (s *AccountService) GetProfile(ctx context.Context, userID int64) (*PublicUserResp, error) {
+	user, err := s.findUserByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	return toPublicUserResp(user), nil
+}
+
+// GetMyProfile 查询自己的完整资料(走 GET /users/me)
+func (s *AccountService) GetMyProfile(ctx context.Context, userID int64) (*UserResp, error) {
+	user, err := s.findUserByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
 	return toUserResp(user), nil
 }
 
 // UpdateProfile 更新用户资料(只允许改 AvatarURL / Email)
 // 返回更新后的 UserResp 给前端展示
 func (s *AccountService) UpdateProfile(ctx context.Context, userID int64, req UpdateProfileReq) (*UserResp, error) {
-	user, err := s.userrepo.FindByID(ctx, userID)
+	user, err := s.findUserByID(ctx, userID)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return nil, errs.ErrNotFound.WithMsg("用户不存在")
-		}
-		return nil, errs.ErrInternal.WithMsg("查询用户失败")
+		return nil, err
 	}
 
 	// 邮箱唯一性校验(若要改成新邮箱)
@@ -296,8 +329,7 @@ func (s *AccountService) SendSmsCode(ctx context.Context, req SendSmsCodeReq) (s
 		return "", errs.ErrInternal.WithMsg("短信服务未启用")
 	}
 	code := fmt.Sprintf("%06d", rand.Intn(1000000))
-	key := "feed:sms:" + req.Phone
-	if err := s.rdb.Set(ctx, key, code, 5*time.Minute).Err(); err != nil {
+	if err := s.rdb.Set(ctx, smsCodeKey(req.Phone), code, 5*time.Minute).Err(); err != nil {
 		return "", errs.ErrInternal.WithMsg("验证码存储失败")
 	}
 	// dev 模式:打印到日志,方便调试
@@ -309,20 +341,65 @@ func (s *AccountService) SendSmsCode(ctx context.Context, req SendSmsCodeReq) (s
 	return "", nil
 }
 
-// verifySmsCode 内部辅助:校验 + 一次性消费
-func (s *AccountService) verifySmsCode(ctx context.Context, phone, code string) error {
+// smsCodeKey 验证码在 Redis 中的 key(写入与校验必须用同一个,避免拼错导致校验恒失败)
+func smsCodeKey(phone string) string {
+	return "feed:sms:" + phone
+}
+
+// errMsgSmsCode 验证码失败的统一文案
+const errMsgSmsCode = "验证码错误或已过期"
+
+// readSmsCode 读取验证码。consume=true 时用 GETDEL 原子读取并删除。
+func (s *AccountService) readSmsCode(ctx context.Context, phone string, consume bool) (string, error) {
 	if s.rdb == nil {
-		return errs.ErrInternal.WithMsg("短信服务未启用")
+		return "", errs.ErrInternal.WithMsg("短信服务未启用")
 	}
-	key := "feed:sms:" + phone
-	savedCode, err := s.rdb.Get(ctx, key).Result()
-	if errors.Is(err, redis.Nil) || savedCode != code {
-		return errs.ErrInvalidParam.WithMsg("验证码错误或已过期")
+	var (
+		saved string
+		err   error
+	)
+	if consume {
+		saved, err = s.rdb.GetDel(ctx, smsCodeKey(phone)).Result()
+	} else {
+		saved, err = s.rdb.Get(ctx, smsCodeKey(phone)).Result()
 	}
+	if errors.Is(err, redis.Nil) {
+		return "", errs.ErrInvalidParam.WithMsg(errMsgSmsCode)
+	}
+	// Redis 故障不能伪装成「验证码错误」:既掩盖了真实故障,也误导用户去重发短信
 	if err != nil {
-		return errs.ErrInternal.WithMsg("校验验证码失败")
+		return "", errs.ErrInternal.WithMsg("校验验证码失败")
 	}
-	s.rdb.Del(ctx, key) // 校验通过立即删除,防重放
+	return saved, nil
+}
+
+// checkSmsCode 校验验证码但不消费。
+//
+// 用于「验证码之后还有业务校验」的流程(改密):后续校验失败时用户
+// 仍可拿同一个码重试,不必重新等一条短信。
+func (s *AccountService) checkSmsCode(ctx context.Context, phone, code string) error {
+	saved, err := s.readSmsCode(ctx, phone, false)
+	if err != nil {
+		return err
+	}
+	if saved != code {
+		return errs.ErrInvalidParam.WithMsg(errMsgSmsCode)
+	}
+	return nil
+}
+
+// consumeSmsCode 校验并一次性消费验证码。
+//
+// 用 GETDEL 而非 Get+Del:后者两步之间存在窗口,并发请求会读到同一个码
+// 且都通过校验,「一次性」就失效了。
+func (s *AccountService) consumeSmsCode(ctx context.Context, phone, code string) error {
+	saved, err := s.readSmsCode(ctx, phone, true)
+	if err != nil {
+		return err
+	}
+	if saved != code {
+		return errs.ErrInvalidParam.WithMsg(errMsgSmsCode)
+	}
 	return nil
 }
 
@@ -385,8 +462,12 @@ func (s *AccountService) RefreshToken(ctx context.Context, refreshToken string) 
 }
 
 func (s *AccountService) ChangePassword(ctx context.Context, req ChangePasswordReq) (*TokenResp, error) {
-	// 0. 校验 SMS验证码(防任意人改密)
-	if err := s.verifySmsCode(ctx, req.Phone, req.SmsCode); err != nil {
+	// 0. 校验验证码:既放最前,又不消费。
+	//
+	// 放最前 —— 若排在业务校验之后,攻击者拿弱密码去试码,收到
+	//            「密码强度不足」而不是「验证码错误」,就等于确认码猜中了。
+	// 不消费 —— 后面的业务校验失败时用户还能用同一个码重试,不必重发短信。
+	if err := s.checkSmsCode(ctx, req.Phone, req.SmsCode); err != nil {
 		return nil, err
 	}
 
@@ -409,18 +490,26 @@ func (s *AccountService) ChangePassword(ctx context.Context, req ChangePasswordR
 		return nil, errs.ErrInvalidParam.WithMsg("新密码不能与旧密码相同")
 	}
 
-	// 4. 更新 user.Version + 新 bcrypt 哈希
+	// 4. 先算哈希 —— bcrypt 是这里唯一还会失败的步骤,放在消费验证码之前,
+	//    免得哈希出错把用户的验证码白白烧掉
 	hashed, err := password.Hash(req.Password)
 	if err != nil {
 		return nil, errs.ErrInternal.WithMsg("密码哈希失败")
 	}
+
+	// 5. 业务校验全过了,到这里才真正消费验证码
+	if err := s.consumeSmsCode(ctx, req.Phone, req.SmsCode); err != nil {
+		return nil, err
+	}
+
+	// 6. 更新 user.Version + 新 bcrypt 哈希
 	user.Password = hashed
 	user.Version++ // ★ 让该用户所有旧 token 立刻失效
 	if err := s.userrepo.Update(ctx, user); err != nil {
 		return nil, errs.ErrInternal.WithMsg("更新用户失败")
 	}
 
-	// 5. 发放新的 token(用新 version,旧 token 失效)
+	// 7. 发放新的 token(用新 version,旧 token 失效)
 	return &TokenResp{
 		AccessToken:  mustSignTokenWithVersion(user.ID, user.Version, token.DefaultAccessTTL),
 		RefreshToken: mustSignTokenWithVersion(user.ID, user.Version, token.DefaultRefreshTTL),
@@ -444,6 +533,20 @@ func toUserResp(u *User) *UserResp {
 	}
 }
 
+// toPublicUserResp User → PublicUserResp 转换
+// 显式列出字段:将来往 User 加新字段时,不会自动泄漏到公开接口
+func toPublicUserResp(u *User) *PublicUserResp {
+	if u == nil {
+		return nil
+	}
+	return &PublicUserResp{
+		ID:        u.ID,
+		UserName:  u.UserName,
+		AvatarURL: u.AvatarURL,
+		CreatedAt: u.CreatedAt,
+	}
+}
+
 // mustSignTokenWithVersion 签发带版本号的 token
 func mustSignTokenWithVersion(userID int64, version int64, ttl time.Duration) string {
 	t, err := token.SignTokenWithVersion(userID, version, ttl)
@@ -456,12 +559,9 @@ func mustSignTokenWithVersion(userID int64, version int64, ttl time.Duration) st
 // CheckUserVersion 实现 token.VersionChecker 接口
 // 中间件校验 token 时,会查 DB 当前 Version 与 token 中的 Version 对比
 func (s *AccountService) CheckUserVersion(ctx context.Context, userID int64) (int64, error) {
-	user, err := s.userrepo.FindByID(ctx, userID)
+	user, err := s.findUserByID(ctx, userID)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return 0, errs.ErrNotFound.WithMsg("用户不存在")
-		}
-		return 0, errs.ErrInternal.WithMsg("查询用户失败")
+		return 0, err
 	}
 	return user.Version, nil
 }

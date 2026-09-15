@@ -73,7 +73,7 @@ func (h *AccountHandler) Logout(c *gin.Context) {
 	response.OK(c, gin.H{"logged_out": true})
 }
 
-// GetProfile 获取指定用户资料
+// GetProfile 获取指定用户资料(公开接口,无需登录)
 // GET /api/v1/users/:id
 func (h *AccountHandler) GetProfile(c *gin.Context) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
@@ -91,8 +91,9 @@ func (h *AccountHandler) GetProfile(c *gin.Context) {
 
 // GetMyProfile 获取当前登录用户资料
 // GET /api/v1/users/me
+// 与 GetProfile 的区别:走 GetMyProfile,返回带手机号/邮箱的完整 UserResp
 func (h *AccountHandler) GetMyProfile(c *gin.Context) {
-	user, err := h.svc.GetProfile(c.Request.Context(), middleware.UserID(c))
+	user, err := h.svc.GetMyProfile(c.Request.Context(), middleware.UserID(c))
 	if err != nil {
 		response.Error(c, err)
 		return
