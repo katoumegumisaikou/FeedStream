@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 // jwtSecret JWT 签名密钥
@@ -51,6 +52,11 @@ func signToken(userID int64, version int64, ttl time.Duration) (string, error) {
 		UserID:  userID,
 		Version: version,
 		RegisteredClaims: jwt.RegisteredClaims{
+			// jti:每次签发唯一。
+			// iat / exp 只有秒级精度,同一秒内用相同参数签发会得到完全相同的
+			// token,而刷新流程是「先拉黑旧的、再签新的」—— 没有 jti 就会把
+			// 刚拉黑的那个原样再发一遍,用户下次刷新必然被判重放。
+			ID:        uuid.NewString(),
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 			NotBefore: jwt.NewNumericDate(now),
