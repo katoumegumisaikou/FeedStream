@@ -1,9 +1,14 @@
 package account
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"mime/multipart"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +20,7 @@ import (
 
 	"feed-system/internal/pkg/errs"
 	"feed-system/internal/pkg/token"
+	"feed-system/internal/util/filetype"
 	"feed-system/internal/util/password"
 )
 
@@ -887,5 +893,143 @@ func TestToUserResp(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotContains(t, string(raw), "must-not-leak")
 		assert.NotContains(t, string(raw), "password")
+	})
+}
+
+// ============================================================
+// CheckUserVersion(中间件每次鉴权都会调,是 token 失效机制的执行者)
+// ============================================================
+
+func TestCheckUserVersion(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("返回库里的当前版本号", func(t *testing.T) {
+		svc, repo, _ := newSvc(t)
+		u := seedUser(t, repo)
+
+		// 模拟用户改过密码:DB 版本已经涨到 7
+		bumped := repo.get(u.ID)
+		bumped.Version = 7
+		require.NoError(t, repo.Update(ctx, bumped))
+
+		v, err := svc.CheckUserVersion(ctx, u.ID)
+		require.NoError(t, err)
+		assert.Equal(t, int64(7), v, "必须回源 DB 拿最新版本,否则旧 token 判不出来")
+	})
+
+	t.Run("用户不存在返回资源不存在", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		_, err := svc.CheckUserVersion(ctx, 999)
+		assertCode(t, err, errs.ErrNotFound)
+	})
+
+	t.Run("仓储出错返回内部错误", func(t *testing.T) {
+		svc, repo, _ := newSvc(t)
+		repo.failWith("FindByID", errors.New("db down"))
+
+		_, err := svc.CheckUserVersion(ctx, 1)
+		// 这条尤其重要:查不到版本时若返回 nil 错误,中间件会当成「校验通过」
+		assertCode(t, err, errs.ErrInternal)
+	})
+}
+
+// ============================================================
+// UploadAvatar
+//
+// 本组只覆盖「校验失败」路径 —— 它们都在 os.MkdirAll 之前就 return,不写磁盘。
+// 成功路径(含 Seek 复位、孤儿文件清理、扩展名取自魔数)需要把 AvatarStorageDir
+// 替换成临时目录,而它是硬编码 const,本轮不改生产代码,所以覆盖不到。
+// ============================================================
+
+// avatarHeaderWith 造一个带内容的 *multipart.FileHeader。
+// FileHeader 的 content 是未导出字段,只能靠 multipart 往返生成。
+func avatarHeaderWith(t *testing.T, filename string, content []byte) *multipart.FileHeader {
+	t.Helper()
+
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	part, err := w.CreateFormFile("avatar", filename)
+	require.NoError(t, err)
+	_, err = part.Write(content)
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+
+	form, err := multipart.NewReader(&buf, w.Boundary()).ReadForm(32 << 20)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = form.RemoveAll() })
+
+	fhs := form.File["avatar"]
+	require.Len(t, fhs, 1)
+	return fhs[0]
+}
+
+func TestUploadAvatar(t *testing.T) {
+	// 用一个不可能真实存在的 ID,好断言「被拒时没在磁盘上留下目录」
+	const userID = 999999001
+	ctx := context.Background()
+
+	// imageSample 造「魔数合法 + 填充」的样本,长度达到 HeaderSize
+	imageSample := func(magic []byte) []byte {
+		b := make([]byte, filetype.HeaderSize+8)
+		copy(b, magic)
+		return b
+	}
+
+	rejectedWithoutDisk := func(t *testing.T, err error) {
+		t.Helper()
+		assertCode(t, err, errs.ErrInvalidParam)
+		_, statErr := os.Stat(filepath.Join(AvatarStorageDir, fmt.Sprintf("%d", userID)))
+		assert.True(t, os.IsNotExist(statErr),
+			"被拒时不该创建任何目录 —— 说明它确实在 os.MkdirAll 之前就返回了")
+	}
+
+	t.Run("空文件被拒", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		// Size 是导出字段,可以直接构造。大小校验排在 Open 之前,不需要 content
+		fh := &multipart.FileHeader{Filename: "a.png", Size: 0}
+		rejectedWithoutDisk(t, svc.UploadAvatar(ctx, fh, userID))
+	})
+
+	t.Run("超过10MiB被拒", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		fh := &multipart.FileHeader{Filename: "a.png", Size: maxAvatarSize + 1}
+		rejectedWithoutDisk(t, svc.UploadAvatar(ctx, fh, userID))
+	})
+
+	t.Run("刚好10MiB不被大小校验拒绝", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		// 边界:判定写的是 > 不是 >=,等于上限应当放行。
+		// 这里没给 content,会在下一步 Open 上失败 —— 恰好证明它过了大小校验
+		fh := &multipart.FileHeader{Filename: "a.png", Size: maxAvatarSize}
+		assertCode(t, svc.UploadAvatar(ctx, fh, userID), errs.ErrInternal)
+	})
+
+	t.Run("伪装成图片的HTML被拒", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		// 文件名带 .html,但类型由魔数判定,内容不是图片 → 拒
+		fh := avatarHeaderWith(t, "evil.html", []byte("<!DOCTYPE html><html><script>alert(1)</script>"))
+		rejectedWithoutDisk(t, svc.UploadAvatar(ctx, fh, userID))
+	})
+
+	t.Run("BMP能被识别但不在白名单_被拒", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		// DetectImage 认 "BM",但 allowedAvatarMIME 里没有 BMP ——
+		// 白名单就是用来把「能识别」收窄成「愿意接受」的那一层
+		fh := avatarHeaderWith(t, "a.bmp", imageSample([]byte("BM")))
+		rejectedWithoutDisk(t, svc.UploadAvatar(ctx, fh, userID))
+	})
+
+	t.Run("内容不足12字节且无魔数_被拒", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		fh := avatarHeaderWith(t, "a.png", []byte{0x01, 0x02, 0x03})
+		rejectedWithoutDisk(t, svc.UploadAvatar(ctx, fh, userID))
+	})
+
+	t.Run("Open_失败返回内部错误", func(t *testing.T) {
+		svc, _, _ := newSvc(t)
+		// 零值 FileHeader 既没有内存 content 也没有临时文件,
+		// Open() 会去 os.Open("") 而失败 —— 覆盖「读不出文件」这条分支
+		fh := &multipart.FileHeader{Filename: "a.png", Size: 1024}
+		assertCode(t, svc.UploadAvatar(ctx, fh, userID), errs.ErrInternal)
 	})
 }
