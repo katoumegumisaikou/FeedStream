@@ -602,6 +602,7 @@ func (s *AccountService) UploadAvatar(ctx context.Context, fileheader *multipart
 
 	multiFile, err := fileheader.Open()
 	if err != nil {
+		slog.ErrorContext(ctx, "打开上传文件失败", "user_id", userID, "err", err)
 		return errs.ErrInternal.WithMsg("读取上传文件失败")
 	}
 	defer multiFile.Close()
@@ -610,6 +611,7 @@ func (s *AccountService) UploadAvatar(ctx context.Context, fileheader *multipart
 	header := make([]byte, filetype.HeaderSize)
 	n, readErr := io.ReadFull(multiFile, header)
 	if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+		slog.ErrorContext(ctx, "读取文件头失败", "user_id", userID, "err", readErr)
 		return errs.ErrInternal.WithMsg("读取上传文件失败")
 	}
 	mime, ok := filetype.DetectImage(header[:n])
@@ -622,6 +624,7 @@ func (s *AccountService) UploadAvatar(ctx context.Context, fileheader *multipart
 	}
 	// 魔数读取移动了文件偏移,保存前必须回到文件开头,否则会丢失前 12 字节。
 	if _, err := multiFile.Seek(0, io.SeekStart); err != nil {
+		slog.ErrorContext(ctx, "重置文件偏移失败", "user_id", userID, "err", err)
 		return errs.ErrInternal.WithMsg("读取上传文件失败")
 	}
 
@@ -633,7 +636,7 @@ func (s *AccountService) UploadAvatar(ctx context.Context, fileheader *multipart
 		return err
 	}
 
-	// ext 由 handler 从魔数检测结果推导后传入,不用 fileheader.Filename(客户端可伪造)
+	// ext 来自上面的魔数推导结果,不用 fileheader.Filename(客户端可伪造)
 	fileName := newFileName() + ext
 	filePath := filepath.Join(dir, fileName)
 
@@ -642,8 +645,9 @@ func (s *AccountService) UploadAvatar(ctx context.Context, fileheader *multipart
 		slog.ErrorContext(ctx, "创建头像文件失败", "user_id", userID, "path", filePath, "err", err)
 		return err
 	}
-	// Close 的错误单独记:写入型文件的 close 可能携带延迟写入的错误
-	// (NFS、ext4 延迟分配下的 ENOSPC),不能吞掉
+	// Close 的错误只能记日志:defer 要到函数返回才执行,那时写库早就完成了,
+	// 挡不住「库里指向一个没落稳的文件」。写入型文件的 close 可能携带延迟写入的
+	// 错误(NFS、ext4 延迟分配下的 ENOSPC),至少别让它无声无息
 	defer func() {
 		if cerr := osFile.Close(); cerr != nil {
 			slog.ErrorContext(ctx, "关闭头像文件失败", "user_id", userID, "path", filePath, "err", cerr)
