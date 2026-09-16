@@ -53,6 +53,15 @@ logs/
 avatars/*
 !avatars/.gitkeep
 
+# 运行时产物:用户上传的视频(保留目录,不提交视频文件)
+videos/*
+!videos/.gitkeep
+
+# 运行时产物:分片上传的临时分片,每个会话一个子目录,传完即删
+# 注意是项目内的 tmp/,不是系统 /tmp —— 系统的 /tmp 是 tmpfs(内存盘)
+tmp/video_chunk/*
+!tmp/video_chunk/.gitkeep
+
 # Go workspace(未使用 workspace 特性时启用)
 # go.work.sum
 
