@@ -16,8 +16,27 @@ import (
 
 	"feed-system/internal/database"
 	"feed-system/internal/model/account"
+	"feed-system/internal/model/video"
 	"feed-system/internal/pkg/logger"
 )
+
+// userInfoAdapter 把 account 的用户仓储适配成 video.UserInfoProvider。
+//
+// video 包只声明它需要什么(取作者名和头像),由这里把 account 的实现接上。
+// 这样 video 不必 import account —— 否则两个业务模块双向耦合,
+// 以后 account 想引 video 就成环了
+type userInfoAdapter struct {
+	repo account.UserRepository
+}
+
+// GetAuthorInfo 实现 video.UserInfoProvider
+func (a userInfoAdapter) GetAuthorInfo(ctx context.Context, userID int64) (string, string, error) {
+	u, err := a.repo.FindByID(ctx, userID)
+	if err != nil {
+		return "", "", err
+	}
+	return u.UserName, u.AvatarURL, nil
+}
 
 // getEnv 读环境变量,带默认值
 func getEnv(key, fallback string) string {
@@ -80,19 +99,27 @@ func main() {
 	accountSvc := account.NewAccountService(userRepo, rdb, devMode)
 	accountHandler := account.NewAccountHandler(accountSvc)
 
-	// 6. 创建 gin engine
+	// 6. 装配 video 模块
+	// 作者信息由 account 的仓储提供,但接口声明在 video 包里 —— 依赖倒置
+	videoSvc := video.NewVideoService(db, rdb, userInfoAdapter{repo: userRepo})
+	videoHandler := video.NewVideoHandler(videoSvc)
+
+	// 7. 创建 gin engine
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 	// 头像公开访问: /avatars/{userID}/{fileName}
 	// 仅暴露头像存储目录,不暴露项目或其他本地文件。
 	r.Static(account.AvatarURLPrefix, account.AvatarStorageDir)
+	// 视频公开访问: /videos/{userID}/{fileName}
+	r.Static(video.VideoURLPrefix, video.VideoStorageDir)
 
-	// 7. 注册 account 路由(/api/v1/...)
+	// 8. 注册路由(/api/v1/...)
 	v1 := r.Group("/api/v1")
 	account.RegisterRouter(v1, accountHandler, db, rdb)
+	video.RegisterRouter(v1, videoHandler, db, rdb)
 
-	// 8. 启动 HTTP server
+	// 9. 启动 HTTP server
 	addr := getEnv("HTTP_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:    addr,
@@ -105,7 +132,7 @@ func main() {
 		}
 	}()
 
-	// 9. 优雅退出:收到信号后给 5 秒做收尾
+	// 10. 优雅退出:收到信号后给 5 秒做收尾
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh

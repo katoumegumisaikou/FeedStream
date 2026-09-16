@@ -1,0 +1,117 @@
+package video
+
+import (
+	"errors"
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+
+	"feed-system/internal/middleware"
+	"feed-system/internal/pkg/errs"
+	"feed-system/internal/pkg/response"
+)
+
+// maxChunkBytes 单个分片请求的体积上限。
+//
+// 贴着 VideoChunkSize 定,只给 multipart 的 boundary 和各字段头部留一点余量 ——
+// 限额卡松了就等于没卡:超出的部分 stdlib 会照单全收,而它落到哪由不得你
+const maxChunkBytes = VideoChunkSize + 1<<20
+
+// chunkParseError 把解析 multipart 的错误翻译成业务错误。
+//
+// 必须单独认出 *http.MaxBytesError —— 「分片太大」和「请求格式不对」
+// 对前端是两件事:前者要调小分片,后者是 bug
+func chunkParseError(err error) error {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		return errs.ErrInvalidParam.WithMsg("分片超过大小上限")
+	}
+	return errs.ErrInvalidParam.WithMsg("分片请求格式不正确")
+}
+
+// VideoHandler 视频 HTTP handler
+type VideoHandler struct {
+	svc *VideoService
+}
+
+// NewVideoHandler 构造 VideoHandler
+func NewVideoHandler(svc *VideoService) *VideoHandler {
+	return &VideoHandler{svc: svc}
+}
+
+func (v *VideoHandler) InitChunkUpload(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+
+	var req InitChunkUploadRequest
+	err := c.ShouldBindBodyWithJSON(&req)
+	if err != nil {
+		response.Error(c, errs.ErrInvalidParam)
+		return
+	}
+
+	resp, err := v.svc.InitChunkUpload(c.Request.Context(), req, userID)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
+
+func (v *VideoHandler) UploadChunk(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+
+	// 必须在任何读 body 的操作之前:c.FormFile / c.ShouldBind 内部都会
+	// ParseMultipartForm 把整个 body 读进来,晚一行就已经晚了
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxChunkBytes)
+
+	var req UploadChunkRequest
+	if err := c.ShouldBind(&req); err != nil {
+		response.Error(c, chunkParseError(err))
+		return
+	}
+
+	// form 字段和文件是同一个 multipart body,ParseMultipartForm 只会跑一次,
+	// 所以这里再取文件不会重复读 body
+	fileheader, err := c.FormFile("chunk")
+	if err != nil {
+		response.Error(c, chunkParseError(err))
+		return
+	}
+
+	resp, err := v.svc.UploadChunk(c.Request.Context(), req, userID, fileheader)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
+
+func (v *VideoHandler) CompleteChunkUpload(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+
+	// 这个接口只传元数据、没有文件,所以走 JSON 而不是 multipart
+	var req CompleteChunkUploadReq
+	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
+		response.Error(c, errs.ErrInvalidParam)
+		return
+	}
+
+	resp, err := v.svc.CompleteChunkUpload(c.Request.Context(), req, userID)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}

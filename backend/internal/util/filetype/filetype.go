@@ -18,6 +18,13 @@ const (
 	MIMEBMP  = "image/bmp"
 )
 
+// 支持的视频容器 MIME 类型
+const (
+	MIMEVideoMP4  = "video/mp4"
+	MIMEVideoWebM = "video/webm"
+	MIMEVideoAVI  = "video/x-msvideo"
+)
+
 // HeaderSize 判断文件类型所需的最小头部长度
 // 取最长的规则(WebP 需要 12 字节)作为统一读取长度
 const HeaderSize = 12
@@ -73,6 +80,41 @@ func IsImage(header []byte) bool {
 	return ok
 }
 
+// videoMagics 从头连续匹配的视频魔数
+var videoMagics = []magic{
+	// WebM / Matroska:EBML 头
+	{MIMEVideoWebM, []byte{0x1A, 0x45, 0xDF, 0xA3}},
+}
+
+// DetectVideo 根据文件头字节判断视频容器格式
+//
+// MP4 与 AVI 和 WebP 一样是「分散魔数」,不符合从头连续匹配的模型,单独判断:
+//   - MP4 / MOV / M4V:"ftyp" 在第 4-7 字节(前 4 字节是 box 长度)
+//   - AVI:"RIFF" 在第 0-3 字节,"AVI " 在第 8-11 字节
+//
+// 注意 "ftyp" 是一族容器共用的签名(MP4 / MOV / M4A / 3GP / HEIC 都有),
+// 这里一律归为 video/mp4。对「不让静态伺服把上传内容当 HTML 渲染」这个目的
+// 已经够了 —— 要的是后缀一定是视频而不是 .html
+//
+// 返回匹配到的 MIME 类型;无法识别时返回 "", false
+func DetectVideo(header []byte) (string, bool) {
+	if len(header) >= 12 && bytes.Equal(header[4:8], []byte("ftyp")) {
+		return MIMEVideoMP4, true
+	}
+	if len(header) >= 12 &&
+		bytes.Equal(header[0:4], []byte("RIFF")) &&
+		bytes.Equal(header[8:12], []byte("AVI ")) {
+		return MIMEVideoAVI, true
+	}
+
+	for _, m := range videoMagics {
+		if bytes.HasPrefix(header, m.bytes) {
+			return m.mime, true
+		}
+	}
+	return "", false
+}
+
 // extByMIME 各 MIME 对应的文件扩展名(带点)
 var extByMIME = map[string]string{
 	MIMEJPEG: ".jpg",
@@ -80,6 +122,10 @@ var extByMIME = map[string]string{
 	MIMEGIF:  ".gif",
 	MIMEWebP: ".webp",
 	MIMEBMP:  ".bmp",
+
+	MIMEVideoMP4:  ".mp4",
+	MIMEVideoWebM: ".webm",
+	MIMEVideoAVI:  ".avi",
 }
 
 // ExtForMIME 返回 MIME 对应的扩展名(带点)

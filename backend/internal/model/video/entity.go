@@ -7,11 +7,15 @@ import (
 )
 
 // 视频状态
+//
+// 数值不能重排:数据库列是 SMALLINT,已有数据按当前数值解释。
+// 新增状态一律往后追加,不要插在中间。
 const (
-	StatusTranscoding     int8 = iota // 0 转码中
+	StatusTranscoding     int8 = iota // 0 转码中(尚未接入转码,当前没有代码写入这个值)
 	StatusPublished                   // 1 已发布
-	StatusTranscodeFailed             // 2 转码失败
+	StatusTranscodeFailed             // 2 转码失败(同上,预留)
 	StatusRemoved                     // 3 已下架
+	StatusDraft                       // 4 草稿:分片上传完成,但还没编辑标题/封面
 )
 
 type Video struct {

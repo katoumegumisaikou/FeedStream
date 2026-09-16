@@ -1,0 +1,562 @@
+package video
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
+	"os"
+	"path/filepath"
+	"strconv"
+	"time"
+
+	"feed-system/internal/pkg/errs"
+	"feed-system/internal/util/filetype"
+
+	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
+	"gorm.io/gorm"
+)
+
+// MaxVideoSize 是单个视频文件允许的最大大小:1 GiB(1024^3 字节)。
+const MaxVideoSize int64 = 1 << 30
+
+// VideoChunkSize 是视频上传时每个分片的大小:5 MiB(5×1024^2 字节)。
+const VideoChunkSize int64 = 5 << 20
+
+const uploadDeclarationTTL = 24 * time.Hour
+
+// 上传会话状态
+const (
+	uploadStatusPending   int8 = 0 // 分片还没收齐
+	uploadStatusCompleted int8 = 1 // 已合并完成,结果看 UploadDeclaration.VideoID
+)
+
+// completedDeclarationTTL 合并完成后会话再保留一段时间。
+//
+// 不能合并完就删:客户端可能没收到响应而重试(响应丢包),
+// 那时应该原样返回同一个结果,而不是告诉用户「会话不存在」——
+// 后者会让用户以为 1GB 白传了
+const completedDeclarationTTL = time.Hour
+
+// mergeLockTTL 合并锁的存活时间。进程崩在合并中途时,锁靠它自动过期
+const mergeLockTTL = 2 * time.Minute
+
+// UploadDeclaration 记录一次分片上传的文件声明,用于保存到 Redis。
+type UploadDeclaration struct {
+	UploadID    string    `json:"upload_id"`    // 上传会话 ID
+	UserID      int64     `json:"user_id"`      // 上传用户 ID
+	Filename    string    `json:"filename"`     // 原始文件名
+	FileSize    int64     `json:"file_size"`    // 文件大小,单位为 Byte
+	FileHash    string    `json:"file_hash"`    // 文件 SHA-256 哈希
+	ChunkSize   int64     `json:"chunk_size"`   // 分片大小,单位为 Byte
+	TotalChunks int       `json:"total_chunks"` // 分片总数
+	CreatedAt   time.Time `json:"created_at"`   // 声明创建时间
+
+	Status  int8  `json:"status"`   // 会话状态,见 uploadStatus*
+	VideoID int64 `json:"video_id"` // 合并完成后建的草稿视频 ID
+}
+
+// UserInfoProvider 视频模块需要的用户信息。
+//
+// 在 video 包里定义接口、由 main.go 用 account 的实现适配进来 —— 依赖倒置。
+// 直接 import account 会让两个业务模块双向耦合,以后 account 想引 video 就成环了
+type UserInfoProvider interface {
+	// GetAuthorInfo 取作者的用户名和头像,写入 videos 的冗余字段
+	GetAuthorInfo(ctx context.Context, userID int64) (username, avatarURL string, err error)
+}
+
+// VideoService 视频业务层
+type VideoService struct {
+	videorepo *videoRepository
+	rdb       *redis.Client    // 用 Redis Bitmap 记录已上传分片
+	users     UserInfoProvider // 取作者信息,可为 nil
+}
+
+// NewVideoService 构造 VideoService
+//
+// 直接收 *gorm.DB 而不是仓储实例:仓储类型是包内私有的,要对外构造它
+// 就得导出一个「返回未导出类型」的函数,反而更别扭。
+//
+// users 可以为 nil —— 那样建视频行时作者信息留空。rdb 为 nil 时上传接口直接报「上传服务未启用」
+func NewVideoService(db *gorm.DB, rdb *redis.Client, users UserInfoProvider) *VideoService {
+	return &VideoService{videorepo: &videoRepository{db: db}, rdb: rdb, users: users}
+}
+
+func uploadBitmapKey(uploadID string) string {
+	return "feed:upload:bitmap:" + uploadID
+}
+
+func uploadDeclarationKey(uploadID string) string {
+	return "feed:upload:declaration:" + uploadID
+}
+
+// mergeLockKey 合并锁。并发调 complete 时用它保证只有一个请求真正合并
+func mergeLockKey(uploadID string) string {
+	return "feed:upload:merging:" + uploadID
+}
+
+// markChunkUploaded 将指定分片标记为已上传。Redis Bitmap 每一 bit 对应一个分片。
+func (s *VideoService) markChunkUploaded(ctx context.Context, uploadID string, chunkIndex int64) error {
+	if s.rdb == nil {
+		return errs.ErrInternal.WithMsg("上传服务未启用")
+	}
+	if chunkIndex < 0 {
+		return errs.ErrInvalidParam.WithMsg("分片序号无效")
+	}
+	key := uploadBitmapKey(uploadID)
+	if err := s.rdb.SetBit(ctx, key, chunkIndex, 1).Err(); err != nil {
+		return errs.ErrInternal.WithMsg("记录分片状态失败")
+	}
+	if err := s.rdb.Expire(ctx, key, uploadDeclarationTTL).Err(); err != nil {
+		return errs.ErrInternal.WithMsg("设置分片状态有效期失败")
+	}
+	return nil
+}
+
+// isChunkUploaded 查询指定分片是否已上传。
+func (s *VideoService) isChunkUploaded(ctx context.Context, uploadID string, chunkIndex int64) (bool, error) {
+	if s.rdb == nil {
+		return false, errs.ErrInternal.WithMsg("上传服务未启用")
+	}
+	if chunkIndex < 0 {
+		return false, errs.ErrInvalidParam.WithMsg("分片序号无效")
+	}
+	bit, err := s.rdb.GetBit(ctx, uploadBitmapKey(uploadID), chunkIndex).Result()
+	return bit == 1, err
+}
+
+func (s *VideoService) InitChunkUpload(ctx context.Context, req InitChunkUploadRequest, userID int64) (*InitChunkUploadResp, error) {
+	if s.rdb == nil {
+		return nil, errs.ErrInternal.WithMsg("上传服务未启用")
+	}
+	if userID <= 0 {
+		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+	if req.FileSize <= 0 {
+		return nil, errs.ErrInvalidParam.WithMsg("视频文件大小必须大于 0")
+	}
+	// 1.上传文件声明不能超出1GB
+	if req.FileSize > MaxVideoSize {
+		return nil, errs.ErrInvalidParam.WithMsg("视频文件大小不能超过 1 GiB")
+	}
+
+	// 2.根据文件大小制定文件上传文件分片的范围
+	chunkCounts := (req.FileSize + VideoChunkSize - 1) / VideoChunkSize
+	uploadID := uuid.NewString()
+	declaration := UploadDeclaration{
+		UploadID:    uploadID,
+		UserID:      userID,
+		Filename:    req.Filename,
+		FileSize:    req.FileSize,
+		FileHash:    req.FileHash,
+		ChunkSize:   VideoChunkSize,
+		TotalChunks: int(chunkCounts),
+		CreatedAt:   time.Now(),
+	}
+	data, err := json.Marshal(declaration)
+	if err != nil {
+		return nil, errs.ErrInternal.WithMsg("创建上传声明失败")
+	}
+	if err := s.rdb.Set(ctx, uploadDeclarationKey(uploadID), data, uploadDeclarationTTL).Err(); err != nil {
+		return nil, errs.ErrInternal.WithMsg("保存上传声明失败")
+	}
+
+	// Bitmap 初始状态全部为 0;每一 bit 对应一个分片,0 表示未上传,1 表示已上传。
+	// 收到分片后通过 SETBIT 将对应 bit 标记为 1。
+	return &InitChunkUploadResp{
+		UploadID:    uploadID,
+		ChunkSize:   VideoChunkSize,
+		TotalChunks: int(chunkCounts),
+	}, nil
+}
+
+// ============================================================
+// 存储路径
+// ============================================================
+
+// VideoStorageDir 最终视频的存储根目录(硬编码,换机器/进容器会失效,应改为配置)
+const VideoStorageDir = "/home/megumi/gocodehub/feed_system/videos"
+
+// VideoURLPrefix 视频对外 URL 前缀,由 main.go 的静态路由挂载。
+// 必须与 VideoStorageDir 对应,否则写进库的 URL 会 404
+const VideoURLPrefix = "/videos"
+
+// chunkStorageDir 分片上传的临时根目录,每个会话一个子目录。
+//
+// 必须是项目内的目录,不能用系统 /tmp:多数机器的 /tmp 是 tmpfs(内存盘),
+// 大视频会把内存吃光;而且跨文件系统 rename 会返回 EXDEV
+//
+// TODO(待议④): 这个目录下的孤儿目录目前没有任何东西回收,来源有四种 ——
+// 客户端传一半放弃、重试的分片在 RemoveAll 之后才落盘、合并中途失败、进程崩溃。
+// 计划另起一个独立进程定期清理(不放 web 进程里:多实例部署会重复扫):
+// 扫一级子目录,目录名是 uuid 的,查 feed:upload:declaration:<目录名> 是否还存在,
+// 不存在就 RemoveAll —— 这个判据零误杀,declaration 还在说明用户可能还在传。
+// 再加一条「mtime 超过 7 天就删」兜底。
+const chunkStorageDir = "/home/megumi/gocodehub/feed_system/tmp/video_chunk"
+
+// sessionChunkDir 某个上传会话的分片目录
+func sessionChunkDir(uploadID string) string {
+	return filepath.Join(chunkStorageDir, uploadID)
+}
+
+// chunkPathAt 第 index 个分片的路径。分片名就是序号,不含任何客户端输入
+func chunkPathAt(uploadID string, index int) string {
+	return filepath.Join(sessionChunkDir(uploadID), strconv.Itoa(index))
+}
+
+// chunkSizeAt 第 index 片的期望字节数:最后一片通常不足 ChunkSize
+func chunkSizeAt(decl *UploadDeclaration, index int) int64 {
+	if index == decl.TotalChunks-1 {
+		if rest := decl.FileSize % decl.ChunkSize; rest != 0 {
+			return rest
+		}
+	}
+	return decl.ChunkSize
+}
+
+// writeChunkFile 把一个分片写进会话目录。
+//
+// 先写随机命名的临时文件、再 rename 成序号 —— 同一文件系统内 rename 是原子的,
+// 所以重复上传同一分片是整体覆盖,不会留下写了一半却被当成有效分片的东西。
+//
+// 临时文件必须建在目标目录里:os.CreateTemp("", ...) 会落到系统临时目录,
+// 跨文件系统 rename 返回 EXDEV
+func writeChunkFile(dir string, index int, fh *multipart.FileHeader) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return errs.ErrInternal.WithMsg("创建分片目录失败")
+	}
+
+	src, err := fh.Open()
+	if err != nil {
+		return errs.ErrInternal.WithMsg("读取分片内容失败")
+	}
+	defer src.Close()
+
+	tmp, err := os.CreateTemp(dir, ".part-*")
+	if err != nil {
+		return errs.ErrInternal.WithMsg("创建分片临时文件失败")
+	}
+	tmpName := tmp.Name()
+
+	if _, err := io.Copy(tmp, src); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return errs.ErrInternal.WithMsg("写入分片失败")
+	}
+	// 写入型文件的 Close 可能携带延迟写入的错误,必须在 rename 之前判 ——
+	// 否则会把一个没落稳的文件 rename 成正式分片
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return errs.ErrInternal.WithMsg("写入分片失败")
+	}
+
+	if err := os.Rename(tmpName, filepath.Join(dir, strconv.Itoa(index))); err != nil {
+		_ = os.Remove(tmpName)
+		return errs.ErrInternal.WithMsg("保存分片失败")
+	}
+	return nil
+}
+
+// loadDeclaration 从 Redis 取上传声明。会话不存在时会顺带清理残留的分片目录
+func (s *VideoService) loadDeclaration(ctx context.Context, uploadID string) (*UploadDeclaration, error) {
+	if s.rdb == nil {
+		return nil, errs.ErrInternal.WithMsg("上传服务未启用")
+	}
+
+	// uploadID 会被拼进文件路径当目录名,而它是客户端传来的字符串。
+	// 不先卡格式的话,upload_id = "../.." 之类的值就能让后面的
+	// MkdirAll / RemoveAll 作用到任意路径上
+	if _, err := uuid.Parse(uploadID); err != nil {
+		return nil, errs.ErrInvalidParam.WithMsg("上传会话 ID 格式不正确")
+	}
+
+	raw, err := s.rdb.Get(ctx, uploadDeclarationKey(uploadID)).Result()
+	if errors.Is(err, redis.Nil) {
+		_ = os.RemoveAll(sessionChunkDir(uploadID)) // 会话没了,分片也没用了
+		return nil, errs.ErrNotFound.WithMsg("上传会话不存在或已过期")
+	}
+	if err != nil {
+		return nil, errs.ErrInternal.WithMsg("读取上传会话失败")
+	}
+
+	var decl UploadDeclaration
+	if err := json.Unmarshal([]byte(raw), &decl); err != nil {
+		return nil, errs.ErrInternal.WithMsg("上传会话数据损坏")
+	}
+	return &decl, nil
+}
+
+// UploadChunk 接收一个分片并落盘,返回当前上传进度
+func (s *VideoService) UploadChunk(ctx context.Context, req UploadChunkRequest, userID int64, fileHeader *multipart.FileHeader) (*UploadChunkResp, error) {
+	if userID <= 0 {
+		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+
+	// 1. 取上传声明(内部先校验 uploadID 格式,再读 Redis)
+	decl, err := s.loadDeclaration(ctx, req.UploadID)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 校验归属与会话状态。
+	//
+	// 归属:强鉴权只证明「已登录」,不证明「这个会话是你的」。
+	// 状态:已完成的会话再收分片,会重建已清理的分片目录和 bitmap,
+	//       还会给客户端一个误导的「上传成功」。
+	//
+	// 合并进行中那段空窗挡不住(那时 Status 还是 pending),但代价只是孤儿目录,
+	// 由定期清理兜底 —— 加锁或查 Redis 不划算
+	if decl.UserID != userID {
+		return nil, errs.ErrForbidden.WithMsg("无权操作该上传会话")
+	}
+	if decl.Status == uploadStatusCompleted {
+		return nil, errs.ErrConflict.WithMsg("该上传已完成")
+	}
+
+	// 3. 分片序号必须落在 [0, TotalChunks),否则会写出 TotalChunks 之外的野文件
+	if req.ChunkIndex < 0 || req.ChunkIndex >= decl.TotalChunks {
+		return nil, errs.ErrInvalidParam.WithMsg("分片序号超出范围")
+	}
+
+	// 4. 大小必须与声明吻合。不校验的话,拼出来的文件长度对不上,
+	//    而发现时用户已经白传了整个文件
+	if want := chunkSizeAt(decl, req.ChunkIndex); fileHeader.Size != want {
+		return nil, errs.ErrInvalidParam.WithMsg(
+			fmt.Sprintf("分片大小不符:第 %d 片应为 %d 字节", req.ChunkIndex, want))
+	}
+
+	// 5. 落盘
+	if err := writeChunkFile(sessionChunkDir(decl.UploadID), req.ChunkIndex, fileHeader); err != nil {
+		return nil, err
+	}
+
+	// 6. 标记已上传。必须排在落盘之后 —— 反过来的话,崩在两步之间会留下
+	//    「bitmap 说有、文件其实不在」的静默缺片,而且永远不会重传
+	if err := s.markChunkUploaded(ctx, decl.UploadID, int64(req.ChunkIndex)); err != nil {
+		return nil, err
+	}
+
+	// 7. 汇总进度。重复上传的分片不会让计数偏大 —— bitmap 是按位去重的
+	uploaded, err := s.rdb.BitCount(ctx, uploadBitmapKey(decl.UploadID), nil).Result()
+	if err != nil {
+		return nil, errs.ErrInternal.WithMsg("读取上传进度失败")
+	}
+	count := int(uploaded)
+
+	return &UploadChunkResp{
+		UploadID:      decl.UploadID,
+		ChunkIndex:    req.ChunkIndex,
+		Uploaded:      true,
+		Completed:     count == decl.TotalChunks,
+		UploadedCount: count,
+		TotalChunks:   decl.TotalChunks,
+	}, nil
+}
+
+// ============================================================
+// 合并
+// ============================================================
+
+// videoDir 某个用户的视频目录
+func videoDir(userID int64) string {
+	return filepath.Join(VideoStorageDir, strconv.FormatInt(userID, 10))
+}
+
+// mergeResult 合并产物
+type mergeResult struct {
+	Path string // 临时文件路径
+	Size int64  // 实际字节数
+	Hash string // 实际 sha256(hex)
+}
+
+// readChunkHead 读第一个分片的前 HeaderSize 字节,用于判容器类型。
+// 第一个分片就是文件开头,所以不用等整个文件拼完
+func readChunkHead(uploadID string) ([]byte, error) {
+	f, err := os.Open(chunkPathAt(uploadID, 0))
+	if err != nil {
+		return nil, errs.ErrInternal.WithMsg("分片缺失,无法合并")
+	}
+	defer f.Close()
+
+	head := make([]byte, filetype.HeaderSize)
+	n, err := io.ReadFull(f, head)
+	// 文件比 HeaderSize 还短是合法的(极小视频),n 就是实际长度
+	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		return nil, errs.ErrInternal.WithMsg("读取分片头部失败")
+	}
+	return head[:n], nil
+}
+
+// concatChunks 按序号拼接分片,边拼边算 sha256。
+//
+// 边拼边算而不是拼完再读一遍:1GB 的文件能省掉一次完整读盘。
+// 先写随机名的临时文件,容器类型判出来之后再 rename 成最终名
+func concatChunks(decl *UploadDeclaration) (*mergeResult, error) {
+	dir := videoDir(decl.UserID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, errs.ErrInternal.WithMsg("创建视频目录失败")
+	}
+
+	tmp, err := os.CreateTemp(dir, ".merge-*")
+	if err != nil {
+		return nil, errs.ErrInternal.WithMsg("创建视频临时文件失败")
+	}
+	tmpPath := tmp.Name()
+
+	// 统一失败出口:清掉半成品,不留残缺文件
+	fail := func(msg string) (*mergeResult, error) {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return nil, errs.ErrInternal.WithMsg(msg)
+	}
+
+	hasher := sha256.New()
+	w := io.MultiWriter(tmp, hasher)
+
+	var size int64
+	for i := 0; i < decl.TotalChunks; i++ {
+		src, err := os.Open(chunkPathAt(decl.UploadID, i))
+		if err != nil {
+			return fail("分片缺失,无法合并")
+		}
+		n, err := io.Copy(w, src)
+		_ = src.Close()
+		if err != nil {
+			return fail("合并分片失败")
+		}
+		size += n
+	}
+
+	// close 的错误必须在 rename 之前判,否则会把没落稳的文件当成正式视频
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil, errs.ErrInternal.WithMsg("写入视频文件失败")
+	}
+
+	return &mergeResult{Path: tmpPath, Size: size, Hash: hex.EncodeToString(hasher.Sum(nil))}, nil
+}
+
+// CompleteChunkUpload 合并分片、校验完整性,并把结果登记成一条草稿视频
+func (s *VideoService) CompleteChunkUpload(ctx context.Context, req CompleteChunkUploadReq, userID int64) (*CompleteChunkUploadResp, error) {
+	if userID <= 0 {
+		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+
+	decl, err := s.loadDeclaration(ctx, req.UploadID)
+	if err != nil {
+		return nil, err
+	}
+	if decl.UserID != userID {
+		return nil, errs.ErrForbidden.WithMsg("无权操作该上传会话")
+	}
+
+	// 已经合并过了:客户端重试(响应丢包)走的就是这条路,原样返回,
+	// 不能报「会话不存在」—— 否则用户以为 1GB 白传了
+	if decl.Status == uploadStatusCompleted {
+		return &CompleteChunkUploadResp{VideoID: decl.VideoID, FileSize: decl.FileSize}, nil
+	}
+
+	// 1. 分片必须收齐
+	uploaded, err := s.rdb.BitCount(ctx, uploadBitmapKey(decl.UploadID), nil).Result()
+	if err != nil {
+		return nil, errs.ErrInternal.WithMsg("读取上传进度失败")
+	}
+	if int(uploaded) != decl.TotalChunks {
+		return nil, errs.ErrInvalidParam.WithMsg(
+			fmt.Sprintf("还有 %d 个分片没上传", decl.TotalChunks-int(uploaded)))
+	}
+
+	// 2. 抢合并锁。并发调 complete 时只有一个真正合并,否则会同时往同一路径拼文件
+	locked, err := s.rdb.SetNX(ctx, mergeLockKey(decl.UploadID), 1, mergeLockTTL).Result()
+	if err != nil {
+		return nil, errs.ErrInternal.WithMsg("获取合并锁失败")
+	}
+	if !locked {
+		return nil, errs.ErrTooFrequent.WithMsg("文件正在合并中,请稍后重试")
+	}
+	// 失败时释放,让客户端能重试;成功时会话已标记完成,删掉也无妨
+	defer func() { _ = s.rdb.Del(ctx, mergeLockKey(decl.UploadID)).Err() }()
+
+	// 3. 判容器类型。后缀由魔数推导,不用 decl.Filename ——
+	//    后者客户端可控,传 evil.html 就会被存成 .html,静态伺服时造成 XSS
+	head, err := readChunkHead(decl.UploadID)
+	if err != nil {
+		return nil, err
+	}
+	mime, ok := filetype.DetectVideo(head)
+	if !ok {
+		return nil, errs.ErrInvalidParam.WithMsg("文件不是受支持的视频格式(mp4 / webm / avi)")
+	}
+	ext, ok := filetype.ExtForMIME(mime)
+	if !ok {
+		return nil, errs.ErrInvalidParam.WithMsg("文件不是受支持的视频格式(mp4 / webm / avi)")
+	}
+
+	// 4. 拼接 + 算 sha256
+	merged, err := concatChunks(decl)
+	if err != nil {
+		return nil, err
+	}
+
+	// 5. 完整性校验 —— init 时收的 file_hash 就是为了这一步
+	if merged.Hash != decl.FileHash {
+		_ = os.Remove(merged.Path)
+		return nil, errs.ErrInvalidParam.WithMsg("文件校验失败,请重新上传")
+	}
+	if merged.Size != decl.FileSize {
+		_ = os.Remove(merged.Path)
+		return nil, errs.ErrInvalidParam.WithMsg("文件大小与声明不符,请重新上传")
+	}
+
+	// 6. 定最终名并原子改名(临时文件和目标在同一个目录,同文件系统)
+	// 时间前缀让目录按文件名排序 ≈ 按上传时间排序;uuid 保证同一秒内多次上传也不撞名
+	finalName := time.Now().Format("20060102150405") + "-" + uuid.NewString() + ext
+	finalPath := filepath.Join(videoDir(decl.UserID), finalName)
+	if err := os.Rename(merged.Path, finalPath); err != nil {
+		_ = os.Remove(merged.Path)
+		return nil, errs.ErrInternal.WithMsg("保存视频失败")
+	}
+
+	// 文件已经落盘,后面任何一步失败都要删掉它,避免留下孤儿文件
+	rollback := func() { _ = os.Remove(finalPath) }
+
+	username, avatarURL := "", ""
+	if s.users != nil {
+		username, avatarURL, err = s.users.GetAuthorInfo(ctx, userID)
+		if err != nil {
+			rollback()
+			return nil, errs.ErrInternal.WithMsg("读取作者信息失败")
+		}
+	}
+
+	video := &Video{
+		AuthorID:  userID,
+		Username:  username,
+		AvatarURL: avatarURL,
+		Title:     decl.Filename, // 标题先用原始文件名,发布时再改
+		PlayURL:   VideoURLPrefix + "/" + strconv.FormatInt(userID, 10) + "/" + finalName,
+		CoverURL:  "",          // 封面是另一个文件,走编辑接口补
+		Status:    StatusDraft, // 草稿:还没编辑标题和封面
+	}
+	if err := s.videorepo.CreateVideo(ctx, video); err != nil {
+		rollback()
+		return nil, errs.ErrInternal.WithMsg("创建视频记录失败")
+	}
+
+	// 7. 收尾:分片目录不再需要;会话标记完成并缩短 TTL,让重试能拿到同一结果
+	_ = os.RemoveAll(sessionChunkDir(decl.UploadID))
+	_ = s.rdb.Del(ctx, uploadBitmapKey(decl.UploadID)).Err()
+
+	decl.Status = uploadStatusCompleted
+	decl.VideoID = video.ID
+	if data, mErr := json.Marshal(decl); mErr == nil {
+		s.rdb.Set(ctx, uploadDeclarationKey(decl.UploadID), data, completedDeclarationTTL)
+	}
+
+	return &CompleteChunkUploadResp{VideoID: video.ID, FileSize: merged.Size}, nil
+}
