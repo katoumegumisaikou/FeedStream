@@ -8,10 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"feed-system/internal/pkg/errs"
@@ -19,7 +21,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
-	"gorm.io/gorm"
 )
 
 // MaxVideoSize 单个视频文件上限:1 GiB(1024^3 字节)。
@@ -67,16 +68,15 @@ type UserInfoProvider interface {
 
 // VideoService 视频业务层
 type VideoService struct {
-	videorepo *videoRepository
+	videorepo VideoRepository
 	rdb       *redis.Client    // 用 Redis Bitmap 记录已上传分片
 	users     UserInfoProvider // 取作者信息,可为 nil
 }
 
-// NewVideoService 构造 VideoService。直接收 *gorm.DB 而非仓储实例 ——
-// 仓储类型包内私有,对外构造得导出「返回未导出类型」的函数,更别扭。
+// NewVideoService 构造 VideoService。
 // users 可为 nil(作者信息留空);rdb 为 nil 时上传接口报「上传服务未启用」
-func NewVideoService(db *gorm.DB, rdb *redis.Client, users UserInfoProvider) *VideoService {
-	return &VideoService{videorepo: &videoRepository{db: db}, rdb: rdb, users: users}
+func NewVideoService(videorepo VideoRepository, rdb *redis.Client, users UserInfoProvider) *VideoService {
+	return &VideoService{videorepo: videorepo, rdb: rdb, users: users}
 }
 
 func uploadBitmapKey(uploadID string) string {
@@ -163,15 +163,26 @@ func (s *VideoService) InitChunkUpload(ctx context.Context, req InitChunkUploadR
 }
 
 // 存储路径
+//
+// 都是相对路径,基准是进程工作目录 —— Makefile 的后端 target 全部 cd backend 后启动,
+// 所以运行时产物统一落在 backend/storage/ 之下。换机器 / 进容器不用改代码
 
-// VideoStorageDir 最终视频存储根目录(硬编码,换机器/进容器会失效,应改配置)
-const VideoStorageDir = "/home/megumi/gocodehub/feed_system/videos"
+// VideoStorageDir 最终视频存储根目录
+const VideoStorageDir = "storage/videos"
 
 // VideoURLPrefix 视频对外 URL 前缀,由 main.go 静态路由挂载;必须与 VideoStorageDir 对应,否则入库 URL 会 404
 const VideoURLPrefix = "/videos"
 
-// chunkStorageDir 分片上传的临时根目录,每个会话一个子目录。必须是项目内目录,
-// 不能用系统 /tmp:多数机器 /tmp 是 tmpfs(内存盘),大视频会吃光内存;跨文件系统 rename 返回 EXDEV
+// CoverURLPrefix 封面对外 URL 前缀。
+// cover_url 只接受这个前缀开头的站内路径,校验见 validCoverURL
+const CoverURLPrefix = "/covers"
+
+// CoverStorageDir 封面存储根目录,与 CoverURLPrefix 一一对应
+const CoverStorageDir = "storage/covers"
+
+// chunkStorageDir 分片上传的临时根目录,每个会话一个子目录。
+// 不能借用系统 /tmp:多数机器的 /tmp 是 tmpfs(内存盘),大视频会吃光内存,
+// 而且跨文件系统 rename 会返回 EXDEV
 //
 // TODO(待议④): 这个目录下的孤儿目录目前没有任何东西回收,来源有四种 ——
 // 客户端传一半放弃、重试的分片在 RemoveAll 之后才落盘、合并中途失败、进程崩溃。
@@ -179,7 +190,7 @@ const VideoURLPrefix = "/videos"
 // 扫一级子目录,目录名是 uuid 的,查 feed:upload:declaration:<目录名> 是否还存在,
 // 不存在就 RemoveAll —— 这个判据零误杀,declaration 还在说明用户可能还在传。
 // 再加一条「mtime 超过 7 天就删」兜底。
-const chunkStorageDir = "/home/megumi/gocodehub/feed_system/tmp/video_chunk"
+const chunkStorageDir = "storage/tmp/video_chunk"
 
 func sessionChunkDir(uploadID string) string {
 	return filepath.Join(chunkStorageDir, uploadID)
@@ -515,4 +526,120 @@ func (s *VideoService) CompleteChunkUpload(ctx context.Context, req CompleteChun
 	}
 
 	return &CompleteChunkUploadResp{VideoID: video.ID, FileSize: merged.Size}, nil
+}
+
+// 编辑与发布
+
+// validCoverURL 校验封面地址是站内路径。
+// 这个值前端会直接拿去当 img src,放任客户端传就等于允许存 javascript:
+// 或外站地址;顺手挡掉 "..",免得拼出目录穿越
+func validCoverURL(u string) bool {
+	return strings.HasPrefix(u, CoverURLPrefix+"/") && !strings.Contains(u, "..")
+}
+
+// loadOwnedVideo 取视频并校验归属。
+// 不是作者返回 403 而不是 404:项目其他接口(UploadChunk)也是这个口径,不靠 404 掩盖存在性
+func (s *VideoService) loadOwnedVideo(ctx context.Context, videoID, userID int64) (*Video, error) {
+	if userID <= 0 {
+		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+	if videoID <= 0 {
+		return nil, errs.ErrInvalidParam.WithMsg("视频 ID 无效")
+	}
+
+	video, err := s.videorepo.FindVideoByID(ctx, videoID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, errs.ErrNotFound.WithMsg("视频不存在")
+		}
+		slog.ErrorContext(ctx, "查询视频失败", "video_id", videoID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("查询视频失败")
+	}
+	if video.AuthorID != userID {
+		return nil, errs.ErrForbidden.WithMsg("无权操作该视频")
+	}
+	return video, nil
+}
+
+// UpdateVideo 编辑视频元数据(PUT /videos/:id)
+func (s *VideoService) UpdateVideo(ctx context.Context, videoID, userID int64, req UpdateVideoReq) (*VideoResp, error) {
+	video, err := s.loadOwnedVideo(ctx, videoID, userID)
+	if err != nil {
+		return nil, err
+	}
+	// 下架是运营决定,不该被作者改回去
+	if video.Status == StatusRemoved {
+		return nil, errs.ErrConflict.WithMsg("视频已下架,不能编辑")
+	}
+	if req.CoverURL != "" && !validCoverURL(req.CoverURL) {
+		return nil, errs.ErrInvalidParam.WithMsg("封面地址必须是站内路径")
+	}
+
+	fields := map[string]any{
+		"title":       req.Title,
+		"description": req.Description,
+	}
+	if req.CoverURL != "" {
+		fields["cover_url"] = req.CoverURL
+	}
+	// updated_at 不用写:GORM 对 map 更新也会自动填(AutoUpdateTime 分支)
+	if err := s.videorepo.UpdateVideoFields(ctx, videoID, fields); err != nil {
+		slog.ErrorContext(ctx, "更新视频失败", "video_id", videoID, "user_id", userID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("更新视频失败")
+	}
+
+	video.Title = req.Title
+	video.Description = req.Description
+	if req.CoverURL != "" {
+		video.CoverURL = req.CoverURL
+	}
+	return toVideoResp(video), nil
+}
+
+// PublishVideo 把草稿翻成已发布(POST /videos/:id/publish)
+func (s *VideoService) PublishVideo(ctx context.Context, videoID, userID int64) (*VideoResp, error) {
+	video, err := s.loadOwnedVideo(ctx, videoID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	switch video.Status {
+	case StatusPublished:
+		// 重复发布当成功:客户端响应丢包重试会走到这,
+		// 报错会让用户以为没发出去
+		return toVideoResp(video), nil
+	case StatusDraft:
+		// 继续往下
+	default:
+		return nil, errs.ErrConflict.WithMsg("当前状态不能发布")
+	}
+
+	if err := s.videorepo.UpdateVideoFields(ctx, videoID, map[string]any{"status": StatusPublished}); err != nil {
+		slog.ErrorContext(ctx, "发布视频失败", "video_id", videoID, "user_id", userID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("发布视频失败")
+	}
+	video.Status = StatusPublished
+	return toVideoResp(video), nil
+}
+
+// toVideoResp 把 entity 转成对外视图,不暴露 DeletedAt 与 Popularity
+func toVideoResp(v *Video) *VideoResp {
+	if v == nil {
+		return nil
+	}
+	return &VideoResp{
+		ID:           v.ID,
+		AuthorID:     v.AuthorID,
+		Username:     v.Username,
+		AvatarURL:    v.AvatarURL,
+		Title:        v.Title,
+		Description:  v.Description,
+		PlayURL:      v.PlayURL,
+		CoverURL:     v.CoverURL,
+		CreatedAt:    v.CreatedAt,
+		Status:       v.Status,
+		PlayCount:    v.PlayCount,
+		LikesCount:   v.LikesCount,
+		CommentCount: v.CommentCount,
+	}
 }

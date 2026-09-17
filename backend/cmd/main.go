@@ -88,7 +88,7 @@ func main() {
 	accountSvc := account.NewAccountService(userRepo, rdb, devMode)
 	accountHandler := account.NewAccountHandler(accountSvc)
 
-	videoSvc := video.NewVideoService(db, rdb, userInfoAdapter{repo: userRepo})
+	videoSvc := video.NewVideoService(video.NewVideoRepository(db), rdb, userInfoAdapter{repo: userRepo})
 	videoHandler := video.NewVideoHandler(videoSvc)
 
 	gin.SetMode(gin.ReleaseMode)
@@ -98,6 +98,9 @@ func main() {
 	r.Static(account.AvatarURLPrefix, account.AvatarStorageDir)
 	// 视频公开访问: /videos/{userID}/{fileName}
 	r.Static(video.VideoURLPrefix, video.VideoStorageDir)
+	// 封面公开访问: /covers/{fileName}。
+	// 目录现在还是空的 —— 封面上传接口尚未实现,挂在这里是为了让入库的 cover_url 有落点
+	r.Static(video.CoverURLPrefix, video.CoverStorageDir)
 
 	v1 := r.Group("/api/v1")
 	account.RegisterRouter(v1, accountHandler, db, rdb)

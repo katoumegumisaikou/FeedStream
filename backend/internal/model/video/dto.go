@@ -2,13 +2,17 @@ package video
 
 import "time"
 
-// PublishVideoReq 发布视频请求。PlayURL / CoverURL 不加 binding:"url":
-// 本项目静态资源存相对路径(头像即 /avatars/<uid>/<uuid>.png),url 校验会直接判非法
-type PublishVideoReq struct {
+// UpdateVideoReq 编辑视频元数据(PUT /videos/:id)。
+//
+// 不含 PlayURL:播放地址由服务端在合并分片时推导,让客户端传就等于允许它
+// 指向别人的文件或外站资源。
+//
+// CoverURL 不加 binding:"url" —— 它存的是站内相对路径(/covers/xx.png),
+// url 规则会直接判非法;格式改由 service 层校验前缀
+type UpdateVideoReq struct {
 	Title       string `json:"title"       binding:"required,max=255"`
 	Description string `json:"description" binding:"max=1000"`
-	PlayURL     string `json:"play_url"    binding:"required,max=255"`
-	CoverURL    string `json:"cover_url"   binding:"required,max=255"`
+	CoverURL    string `json:"cover_url"   binding:"omitempty,max=255"` // 留空表示不改动现有封面
 }
 
 // PlayReportReq 播放上报请求
@@ -30,7 +34,7 @@ type VideoResp struct {
 	PlayURL      string    `json:"play_url"`
 	CoverURL     string    `json:"cover_url"`
 	CreatedAt    time.Time `json:"created_at"`
-	Status       int8      `json:"status"` // 状态(0 转码中 / 1 已发布 / 2 转码失败 / 3 已下架)
+	Status       int8      `json:"status"` // 状态(0 转码中 / 1 已发布 / 2 转码失败 / 3 已下架 / 4 草稿)
 	PlayCount    int64     `json:"play_count"`
 	LikesCount   int64     `json:"likes_count"`
 	CommentCount int64     `json:"comment_count"`

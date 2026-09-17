@@ -3,6 +3,7 @@ package video
 import (
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -102,6 +103,61 @@ func (v *VideoHandler) CompleteChunkUpload(c *gin.Context) {
 	}
 
 	resp, err := v.svc.CompleteChunkUpload(c.Request.Context(), req, userID)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
+
+// videoIDParam 取路径里的 :id。转不出 int64 就是客户端传了脏值
+func videoIDParam(c *gin.Context) (int64, error) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		return 0, errs.ErrInvalidParam.WithMsg("视频 ID 无效")
+	}
+	return id, nil
+}
+
+func (v *VideoHandler) UpdateVideo(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+	videoID, err := videoIDParam(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	var req UpdateVideoReq
+	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
+		response.Error(c, errs.ErrInvalidParam)
+		return
+	}
+
+	resp, err := v.svc.UpdateVideo(c.Request.Context(), videoID, userID, req)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
+
+func (v *VideoHandler) PublishVideo(c *gin.Context) {
+	userID := middleware.UserID(c)
+	if userID == 0 {
+		response.Error(c, errs.ErrUnauthorized)
+		return
+	}
+	videoID, err := videoIDParam(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	resp, err := v.svc.PublishVideo(c.Request.Context(), videoID, userID)
 	if err != nil {
 		response.Error(c, err)
 		return

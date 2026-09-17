@@ -37,5 +37,7 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 		priv.POST("/chunk/init", h.InitChunkUpload)         // 初始化上传,拿 upload_id
 		priv.POST("/chunk", h.UploadChunk)                  // 上传一个分片
 		priv.POST("/chunk/complete", h.CompleteChunkUpload) // 合并分片,生成草稿视频
+		priv.PUT("/:id", h.UpdateVideo)                     // 编辑标题 / 简介 / 封面
+		priv.POST("/:id/publish", h.PublishVideo)           // 草稿 → 已发布
 	}
 }
