@@ -49,18 +49,12 @@ dist/
 logs/
 *.log.*
 
-# 运行时产物:用户上传的头像(保留目录,不提交头像文件)
-avatars/*
-!avatars/.gitkeep
-
-# 运行时产物:用户上传的视频(保留目录,不提交视频文件)
-videos/*
-!videos/.gitkeep
-
-# 运行时产物:分片上传的临时分片,每个会话一个子目录,传完即删
-# 注意是项目内的 tmp/,不是系统 /tmp —— 系统的 /tmp 是 tmpfs(内存盘)
-tmp/video_chunk/*
-!tmp/video_chunk/.gitkeep
+# 运行时产物:头像 / 视频 / 封面 / 分片临时目录,统一在 backend/storage/ 下。
+# 只提交目录结构(.gitkeep),上传的文件一律不入库
+# 后两条是必需的:父目录被排除后,里面的文件无法再被单独 re-include
+backend/storage/**
+!backend/storage/**/
+!backend/storage/**/.gitkeep
 
 # Go workspace(未使用 workspace 特性时启用)
 # go.work.sum

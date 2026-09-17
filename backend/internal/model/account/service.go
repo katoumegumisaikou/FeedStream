@@ -526,8 +526,9 @@ func newFileName() string {
 // 必须与 AvatarStorageDir 对应,否则写进库的 URL 会 404
 const AvatarURLPrefix = "/avatars"
 
-// AvatarStorageDir 头像磁盘存储根目录(硬编码,换机器/进容器会失效,应改配置)
-const AvatarStorageDir = "/home/megumi/gocodehub/feed_system/avatars"
+// AvatarStorageDir 头像存储根目录。相对路径,基准是进程工作目录
+// (Makefile 的后端 target 都是 cd backend 后启动,所以落在 backend/storage/avatars)
+const AvatarStorageDir = "storage/avatars"
 
 // 头像大小上限 10 MiB
 const maxAvatarSize = 10 << 20
