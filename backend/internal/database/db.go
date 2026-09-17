@@ -11,23 +11,19 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// Config 数据库配置
 type Config struct {
-	Host     string // 主机地址
-	Port     string // 端口
-	User     string // 用户名
-	Password string // 密码
-	DBName   string // 数据库名
-	SSLMode  string // SSL 模式(开发环境通常 disable)
+	Host     string
+	Port     string
+	User     string
+	Password string
+	DBName   string
+	SSLMode  string // 开发环境通常 disable
 }
 
 // LoadConfigFromEnv 从环境变量加载数据库配置,带默认值
 //
 // TODO(后续重构): 改为从配置文件(config.yaml / config.json)加载
-// 优先级策略待定,常见两种:
-//   - 方案 A: 配置文件提供默认值,环境变量覆盖(12-factor app 推荐)
-//   - 方案 B: 环境变量提供默认值,配置文件覆盖
-// 选定方案后统一调整此处与 main.go 启动流程。
+// 优先级策略待定,选定方案后统一调整此处与 main.go 启动流程。
 func LoadConfigFromEnv() Config {
 	return Config{
 		Host:     getEnv("DB_HOST", "localhost"),
@@ -39,7 +35,6 @@ func LoadConfigFromEnv() Config {
 	}
 }
 
-// DSN 生成 PostgreSQL DSN 字符串
 func (c Config) DSN() string {
 	return fmt.Sprintf(
 		"host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
@@ -47,7 +42,7 @@ func (c Config) DSN() string {
 	)
 }
 
-// Open 建立数据库连接(基于 GORM),并配置连接池
+// Open 建立连接并配置连接池
 func Open(cfg Config) (*gorm.DB, error) {
 	db, err := gorm.Open(postgres.Open(cfg.DSN()), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Warn),
@@ -61,7 +56,7 @@ func Open(cfg Config) (*gorm.DB, error) {
 		return nil, fmt.Errorf("获取底层 *sql.DB 失败: %w", err)
 	}
 
-	// 连接池配置(可按业务调优)
+	// 连接池参数,可按业务调优
 	sqlDB.SetMaxIdleConns(10)
 	sqlDB.SetMaxOpenConns(100)
 	sqlDB.SetConnMaxLifetime(time.Hour)

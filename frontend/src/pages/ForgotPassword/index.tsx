@@ -6,9 +6,8 @@ import SmsCodeButton from '../../components/SmsCodeButton';
 import { changePassword } from '../../api/auth';
 import type { ChangePasswordReq } from '../../types/auth';
 
-// 忘记密码(走 SMS 验证码流程,无需登录态)
-//  - phone + sms_code + new_password
-//  - 后端校验通过后:递增 user.Version → 旧 token 失效 → 发放新 token 并 SetTokenCookies
+// 忘记密码,走 SMS 验证码流程,无需登录态。后端校验通过后递增 user.Version 使旧 token 失效,
+// 再发放新 token 并 SetTokenCookies
 export default function ForgotPasswordPage() {
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm<ChangePasswordReq>();
@@ -77,7 +76,7 @@ export default function ForgotPasswordPage() {
             {
               validator: async (_, value: string) => {
                 if (!value) return Promise.resolve();
-                // 与后端 password.Strong 对齐:只允许 ASCII 可打印字符(排除空格)
+                // 只允许 ASCII 可打印字符(排除空格),对齐后端 password.Strong
                 if (!/^[\x21-\x7E]+$/.test(value)) {
                   return Promise.reject(new Error('密码只能使用字母、数字和常见符号'));
                 }

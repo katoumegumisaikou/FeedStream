@@ -9,13 +9,14 @@ import (
 
 	"feed-system/internal/database/migrations"
 )
-// Migrator 封装 goose,使用 embed.FS 内嵌的 SQL 迁移文件
+
+// Migrator 封装 goose,迁移文件用 embed.FS 内嵌
 type Migrator struct {
 	db *gorm.DB
 	fs migrations.FS
 }
 
-// NewMigrator 创建迁移器,使用 embed.FS 加载 migrations 目录下的所有 SQL
+// NewMigrator 创建迁移器
 func NewMigrator(db *gorm.DB) (*Migrator, error) {
 	if db == nil {
 		return nil, errors.New("db 不能为空")
@@ -62,7 +63,7 @@ func (m *Migrator) Down() error {
 	return nil
 }
 
-// Status 打印当前迁移状态(用于运维排障)
+// Status 打印当前迁移状态(运维排障用)
 func (m *Migrator) Status() error {
 	sqlDB, err := m.db.DB()
 	if err != nil {

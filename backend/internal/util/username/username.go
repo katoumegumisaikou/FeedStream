@@ -3,13 +3,8 @@ package username
 
 import "unicode"
 
-// Validate 校验用户名字符完整性
-// 规则:
-//   - 首字符必须是字母(不能以数字或下划线开头)
-//   - 仅允许字母、数字、下划线
-//   - 至少包含一个字母(防止纯数字用户名)
-//
-// 长度校验由 dto binding 处理(min=3, max=32),本函数只校验字符组成
+// Validate 校验用户名字符组成:首字符须为字母,仅允许字母 / 数字 / 下划线,
+// 且至少含一个字母(防纯数字用户名)。长度(3-32)由 dto binding 处理,本函数不管。
 func Validate(name string) (bool, string) {
 	if len(name) == 0 || !unicode.IsLetter(rune(name[0])) {
 		return false, "用户名必须以字母开头"
@@ -21,7 +16,6 @@ func Validate(name string) (bool, string) {
 		case unicode.IsLetter(r):
 			hasLetter = true
 		case unicode.IsDigit(r), r == '_':
-			// 合法字符
 		default:
 			return false, "用户名只能包含字母、数字和下划线"
 		}

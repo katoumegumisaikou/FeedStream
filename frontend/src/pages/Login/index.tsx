@@ -5,10 +5,7 @@ import AuthLayout from '../../layouts/AuthLayout';
 import { login } from '../../api/auth';
 import type { LoginReq } from '../../types/auth';
 
-// 手机号 + 密码登录
-//  - phone:11 位中国手机号
-//  - password:至少 6 位
-// 成功后由后端 SetTokenCookies 写入 access_token / refresh_token
+// 登录成功后后端通过 SetTokenCookies 写入 access_token / refresh_token
 export default function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm<LoginReq>();
@@ -20,7 +17,7 @@ export default function LoginPage() {
     try {
       await login(values);
       message.success('登录成功');
-      router('/'); // 登录成功后跳首页(暂未实现,先跳根路径)
+      router('/'); // 首页暂未实现,先跳根路径
     } catch {
       // 拦截器已弹错
     } finally {

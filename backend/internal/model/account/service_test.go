@@ -24,14 +24,10 @@ import (
 	"feed-system/internal/util/password"
 )
 
-// ============================================================
 // 测试替身
-// ============================================================
 
-// fakeUserRepo 内存版 UserRepository。
-//
-// 不用 mock 框架:service 的行为高度依赖「读→改→写」的状态流转,
-// 一个有状态的内存实现比逐次 stub 返回值更贴近真实仓储,断言也更好写。
+// fakeUserRepo 内存版 UserRepository。不用 mock 框架:service 依赖「读→改→写」
+// 的状态流转,有状态的内存实现比逐次 stub 更贴近真实仓储
 type fakeUserRepo struct {
 	mu     sync.Mutex
 	users  map[int64]*User
@@ -51,7 +47,7 @@ func newFakeRepo() *fakeUserRepo {
 	}
 }
 
-// failWith 让指定方法强制返回 err
+// 让指定方法强制返回 err
 func (r *fakeUserRepo) failWith(method string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -64,7 +60,7 @@ func (r *fakeUserRepo) callCount(method string) int {
 	return r.calls[method]
 }
 
-// seed 直接写入并返回落库后的副本,不计入调用统计(避免污染副作用断言)
+// 直接写入并返回落库副本,不计入调用统计,避免污染副作用断言
 func (r *fakeUserRepo) seed(u *User) *User {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -79,7 +75,7 @@ func (r *fakeUserRepo) seed(u *User) *User {
 	return &cp
 }
 
-// get 读取当前落库快照
+// 读取当前落库快照
 func (r *fakeUserRepo) get(id int64) *User {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -108,7 +104,6 @@ func (r *fakeUserRepo) Create(_ context.Context, user *User) error {
 	return nil
 }
 
-// findBy 是三个 FindByXxx 的公共实现
 func (r *fakeUserRepo) findBy(method string, match func(*User) bool) (*User, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -199,9 +194,7 @@ func (r *fakeUserRepo) Delete(_ context.Context, id int64) error {
 	return nil
 }
 
-// ============================================================
 // 测试脚手架
-// ============================================================
 
 const (
 	testPassword = "Passw0rd!x" // 字母 + 数字 + 符号,满足 password.Strong
@@ -215,7 +208,7 @@ var (
 	hashVal  string
 )
 
-// testHash 全测试进程只算一次 bcrypt(cost=12 约 250ms,逐条测试现算会拖慢整个套件)
+// 全进程只算一次 bcrypt;cost=12 约 250ms,逐条现算会拖慢整个套件
 func testHash(t *testing.T) string {
 	t.Helper()
 	hashOnce.Do(func() {
@@ -226,7 +219,7 @@ func testHash(t *testing.T) string {
 	return hashVal
 }
 
-// newSvc 返回一个 devMode=true 的 service + Redis 替身
+// 返回 devMode=true 的 service + Redis 替身
 func newSvc(t *testing.T) (*AccountService, *fakeUserRepo, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
@@ -237,7 +230,7 @@ func newSvc(t *testing.T) (*AccountService, *fakeUserRepo, *miniredis.Miniredis)
 	return NewAccountService(repo, rdb, true), repo, mr
 }
 
-// seedUser 落一个可登录的用户
+// 落一个可登录的用户
 func seedUser(t *testing.T, repo *fakeUserRepo) *User {
 	t.Helper()
 	return repo.seed(&User{
@@ -247,7 +240,7 @@ func seedUser(t *testing.T, repo *fakeUserRepo) *User {
 	})
 }
 
-// assertCode 断言 err 是 business ServiceErr 且 Code 匹配
+// 断言 err 是 business ServiceErr 且 Code 匹配
 func assertCode(t *testing.T, err error, want errs.ServiceErr) {
 	t.Helper()
 	require.Error(t, err)
@@ -256,7 +249,7 @@ func assertCode(t *testing.T, err error, want errs.ServiceErr) {
 	assert.Equal(t, want.Code, got.Code, "错误码不匹配,msg=%q", got.Msg)
 }
 
-// claimsOf 解析并校验 token,失败直接终止
+// 解析并校验 token,失败直接终止
 func claimsOf(t *testing.T, tok string) *token.Claims {
 	t.Helper()
 	require.NotEmpty(t, tok, "token 不应为空")
@@ -265,9 +258,7 @@ func claimsOf(t *testing.T, tok string) *token.Claims {
 	return c
 }
 
-// ============================================================
 // Register
-// ============================================================
 
 func TestRegister(t *testing.T) {
 	newReq := func() RegisterReq {
@@ -285,17 +276,16 @@ func TestRegister(t *testing.T) {
 		require.NoError(t, err)
 		require.NotNil(t, resp)
 
-		// 1. token 有效且指向新用户
 		claims := claimsOf(t, resp.AccessToken)
 		claimsOf(t, resp.RefreshToken)
 
-		// 2. 密码必须哈希落库,且原文不能出现在库里
+		// 密码必须哈希落库,原文不能出现在库里
 		stored := repo.get(claims.UserID)
 		require.NotNil(t, stored)
 		assert.NotEqual(t, testPassword, stored.Password, "密码不能明文落库")
 		assert.True(t, password.Verify(stored.Password, testPassword), "哈希应能校验通过")
 
-		// 3. token 里的 version 必须等于 DB 里的版本,否则鉴权中间件比对会 401
+		// token 的 version 必须等于 DB 版本,否则鉴权中间件比对会 401
 		assert.Equal(t, stored.Version, claims.Version,
 			"签发 token 用的 version 必须与落库版本一致")
 		assert.Equal(t, int64(1), claims.Version, "GORM default:1 回填后版本应为 1")
@@ -355,14 +345,12 @@ func TestRegister(t *testing.T) {
 
 		_, err := svc.Register(context.Background(), newReq())
 
-		// 裸 error 到 response 层会退化成 code=1「操作失败」,丢失 10005 语义
+		// 裸 error 到 response 层会退化成 code=1「操作失败」,丢掉业务码
 		assertCode(t, err, errs.ErrInternal)
 	})
 }
 
-// ============================================================
 // Login
-// ============================================================
 
 func TestLogin(t *testing.T) {
 	newReq := func() LoginReq {
@@ -416,7 +404,7 @@ func TestLogin(t *testing.T) {
 			_, err := svc.Login(ctx, bad)
 			got, ok := errs.As(err)
 			require.True(t, ok, "第 %d 次失败应返回业务错误,实际: %v", i, err)
-			// 计数 key 一旦带上 TTL,loginLockCheck 就把它当成「已锁定」
+			// 计数 key 带上 TTL 后,loginLockCheck 会把它当成「已锁定」
 			require.Equal(t, errs.ErrUnauthorized.Code, got.Code,
 				"才错到第 %d 次就报「%s」:锁定阈值退化成了 1 次", i, got.Msg)
 		}
@@ -453,16 +441,14 @@ func TestLogin(t *testing.T) {
 		require.True(t, mr.Exists("feed:fail:"+testPhone), "失败后应留下计数 key")
 
 		_, err := svc.Login(ctx, newReq())
-		// 这里报「失败次数过多」也是同一个阈值 bug:一次失败就把用户锁住了
+		// 报「失败次数过多」就是同一个阈值 bug:一次失败就锁住用户
 		require.NoError(t, err, "密码正确应能登录")
 
 		assert.False(t, mr.Exists("feed:fail:"+testPhone), "成功登录应清零失败计数")
 	})
 }
 
-// ============================================================
 // Logout
-// ============================================================
 
 func TestLogout(t *testing.T) {
 	t.Run("双_token_均进入黑名单", func(t *testing.T) {
@@ -486,9 +472,7 @@ func TestLogout(t *testing.T) {
 	})
 }
 
-// ============================================================
 // GetProfile / UpdateProfile
-// ============================================================
 
 func TestGetProfile(t *testing.T) {
 	t.Run("查他人资料只返回公开字段", func(t *testing.T) {
@@ -505,8 +489,7 @@ func TestGetProfile(t *testing.T) {
 		assert.Equal(t, u.ID, resp.ID)
 		assert.Equal(t, testUserName, resp.UserName)
 
-		// PublicUserResp 本身没有 Phone / Email / LastLoginAt 字段,
-		// 再序列化一遍确认没有别的路径把它们漏出去
+		// PublicUserResp 无 Phone/Email/LastLoginAt 字段,再序列化确认没别的路径漏出去
 		raw, err := json.Marshal(resp)
 		require.NoError(t, err)
 		assert.NotContains(t, string(raw), testPhone, "查他人资料不该带手机号")
@@ -583,9 +566,7 @@ func TestUpdateProfile(t *testing.T) {
 	})
 }
 
-// ============================================================
 // SMS 验证码 / 改密
-// ============================================================
 
 func TestSendSmsCode(t *testing.T) {
 	t.Run("dev_模式返回6位数字码并写入_Redis", func(t *testing.T) {
@@ -620,7 +601,7 @@ func TestSendSmsCode(t *testing.T) {
 }
 
 func TestChangePassword(t *testing.T) {
-	// issue 发一个验证码并返回明文(devMode=true 时直接拿到)
+	// 发一个验证码并返回明文(devMode=true 直接拿到)
 	issue := func(t *testing.T, svc *AccountService) string {
 		t.Helper()
 		code, err := svc.SendSmsCode(context.Background(), SendSmsCodeReq{Phone: testPhone})
@@ -647,7 +628,6 @@ func TestChangePassword(t *testing.T) {
 		assert.True(t, password.Verify(stored.Password, "NewPassw0rd!"))
 		assert.False(t, password.Verify(stored.Password, testPassword))
 
-		// 验证码一次性:用完即删
 		assert.False(t, mr.Exists("feed:sms:"+phone), "验证码校验通过后必须删除")
 	})
 
@@ -711,8 +691,8 @@ func TestChangePassword(t *testing.T) {
 			Phone: testPhone, Password: "NewPassw0rd!", SmsCode: code,
 		})
 
-		// readSmsCode 把 redis.Nil 与其他 err 分开判断:
-		// 连接失败必须报内部错误,不能因为 saved 是空串就退化成「验证码错误」
+		// readSmsCode 把 redis.Nil 与其他 err 分开:连接失败必须报内部错误,
+		// 不能因为 saved 是空串就退化成「验证码错误」
 		assertCode(t, err, errs.ErrInternal)
 	})
 
@@ -740,7 +720,6 @@ func TestChangePassword(t *testing.T) {
 				assert.True(t, mr.Exists("feed:sms:"+testPhone),
 					"校验失败不应消耗验证码,否则用户要重新发短信")
 
-				// 同一个码 + 合法密码应还能成功
 				_, err = svc.ChangePassword(ctx, ChangePasswordReq{
 					Phone: testPhone, Password: "NewPassw0rd!", SmsCode: code,
 				})
@@ -771,8 +750,8 @@ func TestChangePassword(t *testing.T) {
 			wrong = "111111"
 		}
 
-		// 同时给出「验证码错误」和「密码强度不足」,必须报验证码错误 ——
-		// 否则攻击者拿弱密码去试码,收到密码相关的报错就知道自己猜中了
+		// 同时给出「验证码错误」和「密码强度不足」时必须报前者,
+		// 否则攻击者拿弱密码试码,收到密码相关报错就知道自己猜中了
 		_, err := svc.ChangePassword(context.Background(), ChangePasswordReq{
 			Phone: testPhone, Password: "abcdefgh", SmsCode: wrong,
 		})
@@ -782,9 +761,7 @@ func TestChangePassword(t *testing.T) {
 	})
 }
 
-// ============================================================
 // RefreshToken
-// ============================================================
 
 func TestRefreshToken(t *testing.T) {
 	login := func(t *testing.T, svc *AccountService) *TokenResp {
@@ -852,7 +829,7 @@ func TestRefreshToken(t *testing.T) {
 		first, err := svc.RefreshToken(ctx, old.RefreshToken)
 		require.NoError(t, err)
 
-		// 这是客户端最普通的续期行为:access_token 到期就刷一次
+		// access_token 到期就刷一次,是客户端最普通的续期行为
 		_, err = svc.RefreshToken(ctx, first.RefreshToken)
 		assert.NoError(t, err, "刷新签发的新 refresh_token 必须可用,否则用户会被强制登出")
 
@@ -863,9 +840,7 @@ func TestRefreshToken(t *testing.T) {
 	})
 }
 
-// ============================================================
 // toUserResp
-// ============================================================
 
 func TestToUserResp(t *testing.T) {
 	t.Run("nil_安全返回_nil", func(t *testing.T) {
@@ -887,8 +862,7 @@ func TestToUserResp(t *testing.T) {
 		assert.Equal(t, "/avatars/7/a.png", resp.AvatarURL)
 		assert.Equal(t, now, resp.CreatedAt)
 
-		// UserResp 本身没有 Password / Version / DeletedAt 字段,
-		// 这里用 JSON 序列化再确认一次,防止以后有人往 DTO 里加字段
+		// UserResp 无 Password/Version/DeletedAt,序列化再确认一次,防止以后往 DTO 加字段
 		raw, err := json.Marshal(resp)
 		require.NoError(t, err)
 		assert.NotContains(t, string(raw), "must-not-leak")
@@ -896,9 +870,7 @@ func TestToUserResp(t *testing.T) {
 	})
 }
 
-// ============================================================
 // CheckUserVersion(中间件每次鉴权都会调,是 token 失效机制的执行者)
-// ============================================================
 
 func TestCheckUserVersion(t *testing.T) {
 	ctx := context.Background()
@@ -928,21 +900,18 @@ func TestCheckUserVersion(t *testing.T) {
 		repo.failWith("FindByID", errors.New("db down"))
 
 		_, err := svc.CheckUserVersion(ctx, 1)
-		// 这条尤其重要:查不到版本时若返回 nil 错误,中间件会当成「校验通过」
+		// 查不到版本时若返回 nil 错误,中间件会当成「校验通过」
 		assertCode(t, err, errs.ErrInternal)
 	})
 }
 
-// ============================================================
 // UploadAvatar
 //
-// 本组只覆盖「校验失败」路径 —— 它们都在 os.MkdirAll 之前就 return,不写磁盘。
-// 成功路径(含 Seek 复位、孤儿文件清理、扩展名取自魔数)需要把 AvatarStorageDir
-// 替换成临时目录,而它是硬编码 const,本轮不改生产代码,所以覆盖不到。
-// ============================================================
+// 只覆盖「校验失败」路径 —— 都在 os.MkdirAll 之前 return,不写磁盘。
+// 成功路径(Seek 复位、孤儿清理、扩展名取自魔数)要把 AvatarStorageDir 换成
+// 临时目录,它是硬编码 const,本轮不改生产代码,故覆盖不到
 
-// avatarHeaderWith 造一个带内容的 *multipart.FileHeader。
-// FileHeader 的 content 是未导出字段,只能靠 multipart 往返生成。
+// 造一个带内容的 *multipart.FileHeader。content 是未导出字段,只能靠 multipart 往返生成
 func avatarHeaderWith(t *testing.T, filename string, content []byte) *multipart.FileHeader {
 	t.Helper()
 
@@ -964,11 +933,11 @@ func avatarHeaderWith(t *testing.T, filename string, content []byte) *multipart.
 }
 
 func TestUploadAvatar(t *testing.T) {
-	// 用一个不可能真实存在的 ID,好断言「被拒时没在磁盘上留下目录」
+	// 用一个不可能存在的 ID,好断言「被拒时没在磁盘上留下目录」
 	const userID = 999999001
 	ctx := context.Background()
 
-	// imageSample 造「魔数合法 + 填充」的样本,长度达到 HeaderSize
+	// 造「魔数合法 + 填充」的样本,长度达到 HeaderSize
 	imageSample := func(magic []byte) []byte {
 		b := make([]byte, filetype.HeaderSize+8)
 		copy(b, magic)
@@ -985,7 +954,7 @@ func TestUploadAvatar(t *testing.T) {
 
 	t.Run("空文件被拒", func(t *testing.T) {
 		svc, _, _ := newSvc(t)
-		// Size 是导出字段,可以直接构造。大小校验排在 Open 之前,不需要 content
+		// Size 是导出字段可直接构造;大小校验排在 Open 之前,无需 content
 		fh := &multipart.FileHeader{Filename: "a.png", Size: 0}
 		rejectedWithoutDisk(t, svc.UploadAvatar(ctx, fh, userID))
 	})
@@ -998,8 +967,8 @@ func TestUploadAvatar(t *testing.T) {
 
 	t.Run("刚好10MiB不被大小校验拒绝", func(t *testing.T) {
 		svc, _, _ := newSvc(t)
-		// 边界:判定写的是 > 不是 >=,等于上限应当放行。
-		// 这里没给 content,会在下一步 Open 上失败 —— 恰好证明它过了大小校验
+		// 边界:判定是 > 而非 >=,等于上限应放行;这里不给 content,
+		// 会在下一步 Open 失败 —— 恰好证明它过了大小校验
 		fh := &multipart.FileHeader{Filename: "a.png", Size: maxAvatarSize}
 		assertCode(t, svc.UploadAvatar(ctx, fh, userID), errs.ErrInternal)
 	})
@@ -1013,8 +982,7 @@ func TestUploadAvatar(t *testing.T) {
 
 	t.Run("BMP能被识别但不在白名单_被拒", func(t *testing.T) {
 		svc, _, _ := newSvc(t)
-		// DetectImage 认 "BM",但 allowedAvatarMIME 里没有 BMP ——
-		// 白名单就是用来把「能识别」收窄成「愿意接受」的那一层
+		// DetectImage 认 "BM",但白名单没有 BMP:白名单把「能识别」收窄为「愿接受」
 		fh := avatarHeaderWith(t, "a.bmp", imageSample([]byte("BM")))
 		rejectedWithoutDisk(t, svc.UploadAvatar(ctx, fh, userID))
 	})
@@ -1027,8 +995,8 @@ func TestUploadAvatar(t *testing.T) {
 
 	t.Run("Open_失败返回内部错误", func(t *testing.T) {
 		svc, _, _ := newSvc(t)
-		// 零值 FileHeader 既没有内存 content 也没有临时文件,
-		// Open() 会去 os.Open("") 而失败 —— 覆盖「读不出文件」这条分支
+		// 零值 FileHeader 无内存 content 也无临时文件,Open() 会 os.Open("") 失败 ——
+		// 覆盖「读不出文件」这条分支
 		fh := &multipart.FileHeader{Filename: "a.png", Size: 1024}
 		assertCode(t, svc.UploadAvatar(ctx, fh, userID), errs.ErrInternal)
 	})

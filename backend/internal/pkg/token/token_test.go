@@ -5,10 +5,8 @@ import (
 	"time"
 )
 
-// 同一秒内用相同参数签发两次,必须得到不同的 token。
-//
-// 没有 jti 时两者字节完全相同 —— iat / exp 只有秒级精度,而刷新流程是
-// 「先拉黑旧的、再签新的」,于是新 token 一签发就已经在黑名单里,用户下次刷新必然 401。
+// 同一秒内用相同参数签发两次必须得到不同 token。没有 jti 时两者字节完全相同:
+// iat / exp 只有秒级精度,「先拉黑旧的、再签新的」会让新 token 一签发即已入黑名单(下次刷新 401)。
 func TestSignToken_同一秒内签发不重复(t *testing.T) {
 	a, err := SignTokenWithVersion(1, 1, DefaultRefreshTTL)
 	if err != nil {

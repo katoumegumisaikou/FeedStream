@@ -1,7 +1,5 @@
-// Package middleware 存放 gin 中间件
-//
-// 中间件只依赖 gorm / redis / pkg 层工具,不依赖任何业务包,
-// 避免与 model 层形成循环引用。
+// Package middleware 存放 gin 中间件。
+// 只依赖 gorm / redis / pkg 层工具,不依赖业务包,避免与 model 层循环引用。
 package middleware
 
 import (
@@ -31,28 +29,17 @@ func SetSensitive() gin.HandlerFunc {
 	}
 }
 
-// Auth 用户鉴权中间件
+// Auth 用户鉴权中间件,从 cookie 或 Authorization 头取 token,校验签名后注入 userID,
+// 再比对 users.version(见 checkUserVersion);sensitive 路由无 token 直接 401。
 // 用法:router.GET("/api/v1/users/me", middleware.Auth(db, rdb), handler.GetMyProfile)
-//
-// 流程:
-//  1. 从 cookie 或 Authorization 头读 access_token
-//  2. JWT 签名校验(token.Parse)
-//  3. 注入 userID 到 gin.Context
-//  4. 查 users 表当前 version(优先 Redis,miss 时回源 DB 并回写)
-//  5. 不一致 → 401(改密 / 注销后旧 token 失效)
-//  6. 放行
-//
-// 中间件只依赖 gorm + redis,不依赖任何业务包
 func Auth(db *gorm.DB, rdb *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tokenStr := readToken(c)
 		sensitive := c.GetBool("sensitive")
 		if sensitive && tokenStr == "" {
-			// 强鉴权
 			abortUnauthorized(c, "未登录")
 			return
 		} else if !sensitive && tokenStr == "" {
-			// 软鉴权
 			c.Next()
 			return
 		}
@@ -70,14 +57,13 @@ func Auth(db *gorm.DB, rdb *redis.Client) gin.HandlerFunc {
 	}
 }
 
-// checkUserVersion 校验 token 中的 version 与 DB 当前 version 是否一致
-// 优先读 Redis 缓存;缓存 miss / Redis 不可用时回源 DB,再回写缓存
-// 返回 true 表示放行;false 表示已通过 abort 终止请求,调用方直接 return 即可
+// checkUserVersion 比对 token 中的 version 与 DB 当前 version,不一致则 401 ——
+// 改密 / 注销会改 version,使旧 token 失效。
+// 优先读 Redis,miss 或 Redis 不可用时回源 DB 并回写;false 表示已 abort,调用方直接 return。
 func checkUserVersion(c *gin.Context, db *gorm.DB, rdb *redis.Client, userID, tokenVersion int64) bool {
 	ctx := c.Request.Context()
 	cacheKey := userVersionKey(userID)
 
-	// 1. 优先查 Redis
 	if rdb != nil {
 		cached, err := rdb.Get(ctx, cacheKey).Int64()
 		if err == nil {
@@ -90,7 +76,6 @@ func checkUserVersion(c *gin.Context, db *gorm.DB, rdb *redis.Client, userID, to
 		// redis.Nil 或其他错误:都走 DB,不做中断
 	}
 
-	// 2. 回源 DB
 	var dbVersion int64
 	result := db.WithContext(ctx).
 		Table(usersTable).
@@ -106,12 +91,11 @@ func checkUserVersion(c *gin.Context, db *gorm.DB, rdb *redis.Client, userID, to
 		return false
 	}
 
-	// 3. 回写 Redis(只缓存有效用户,TTL 内改密需要同步清缓存才能立即生效)
+	// 回写缓存;只缓存有效用户,TTL 内改密需同步清缓存才能立即生效
 	if rdb != nil {
 		rdb.Set(ctx, cacheKey, dbVersion, versionCacheTTL)
 	}
 
-	// 4. 对比
 	if tokenVersion != dbVersion {
 		abortUnauthorized(c, "token 已失效,请重新登录")
 		return false

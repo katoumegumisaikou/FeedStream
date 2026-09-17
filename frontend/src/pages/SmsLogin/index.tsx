@@ -6,9 +6,6 @@ import SmsCodeButton from '../../components/SmsCodeButton';
 import { smsLogin } from '../../api/auth';
 import type { SmsLoginReq } from '../../types/auth';
 
-// 手机号 + 短信验证码登录
-//  - 点击"获取验证码"按钮触发 SmsCodeButton(60s 倒计时)
-//  - sms_code 字段 6 位数字
 export default function SmsLoginPage() {
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm<SmsLoginReq>();

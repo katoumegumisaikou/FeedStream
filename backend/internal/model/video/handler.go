@@ -11,16 +11,12 @@ import (
 	"feed-system/internal/pkg/response"
 )
 
-// maxChunkBytes 单个分片请求的体积上限。
-//
-// 贴着 VideoChunkSize 定,只给 multipart 的 boundary 和各字段头部留一点余量 ——
-// 限额卡松了就等于没卡:超出的部分 stdlib 会照单全收,而它落到哪由不得你
+// maxChunkBytes 单个分片请求体积上限。贴着 VideoChunkSize 定,只给 multipart
+// boundary 与各字段头留余量 —— 卡松了等于没卡:超出部分 stdlib 照单全收,落哪由不得你
 const maxChunkBytes = VideoChunkSize + 1<<20
 
-// chunkParseError 把解析 multipart 的错误翻译成业务错误。
-//
-// 必须单独认出 *http.MaxBytesError —— 「分片太大」和「请求格式不对」
-// 对前端是两件事:前者要调小分片,后者是 bug
+// chunkParseError 把 multipart 解析错误翻译成业务错误。必须单独认出 *http.MaxBytesError ——
+// 「分片太大」和「请求格式不对」对前端是两件事:前者调小分片,后者是 bug
 func chunkParseError(err error) error {
 	var maxErr *http.MaxBytesError
 	if errors.As(err, &maxErr) {
@@ -29,12 +25,10 @@ func chunkParseError(err error) error {
 	return errs.ErrInvalidParam.WithMsg("分片请求格式不正确")
 }
 
-// VideoHandler 视频 HTTP handler
 type VideoHandler struct {
 	svc *VideoService
 }
 
-// NewVideoHandler 构造 VideoHandler
 func NewVideoHandler(svc *VideoService) *VideoHandler {
 	return &VideoHandler{svc: svc}
 }
@@ -68,8 +62,8 @@ func (v *VideoHandler) UploadChunk(c *gin.Context) {
 		return
 	}
 
-	// 必须在任何读 body 的操作之前:c.FormFile / c.ShouldBind 内部都会
-	// ParseMultipartForm 把整个 body 读进来,晚一行就已经晚了
+	// 必须在任何读 body 的操作之前 —— c.FormFile / c.ShouldBind 内部会
+	// ParseMultipartForm 把整个 body 读进来,晚一行就晚了
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxChunkBytes)
 
 	var req UploadChunkRequest
@@ -78,8 +72,7 @@ func (v *VideoHandler) UploadChunk(c *gin.Context) {
 		return
 	}
 
-	// form 字段和文件是同一个 multipart body,ParseMultipartForm 只会跑一次,
-	// 所以这里再取文件不会重复读 body
+	// form 字段和文件同属一个 multipart body,ParseMultipartForm 只跑一次,再取文件不会重复读 body
 	fileheader, err := c.FormFile("chunk")
 	if err != nil {
 		response.Error(c, chunkParseError(err))

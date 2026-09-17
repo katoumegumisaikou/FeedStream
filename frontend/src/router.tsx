@@ -4,12 +4,6 @@ import SmsLoginPage from './pages/SmsLogin';
 import RegisterPage from './pages/Register';
 import ForgotPasswordPage from './pages/ForgotPassword';
 
-// 路由表:
-//  - /login             手机号 + 密码登录(默认入口)
-//  - /login/sms         手机号 + 短信验证码登录
-//  - /register          注册
-//  - /forgot-password   忘记密码(SMS 验证码流程)
-//  - /                  重定向到 /login
 export function AppRouter() {
   return (
     <Routes>

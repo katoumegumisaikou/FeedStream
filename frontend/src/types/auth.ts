@@ -7,7 +7,6 @@ export interface ApiResp<T = unknown> {
   data: T;
 }
 
-// POST /api/v1/auth/register 请求体
 export interface RegisterReq {
   user_name: string;
   password: string;
@@ -15,43 +14,37 @@ export interface RegisterReq {
   email?: string;
 }
 
-// POST /api/v1/auth/login 请求体
 export interface LoginReq {
   phone: string;
   password: string;
 }
 
-// POST /api/v1/auth/login (SMS 变体)请求体
 export interface SmsLoginReq {
   phone: string;
   sms_code: string;
 }
 
-// PUT /api/v1/auth/password 请求体(忘记密码/改密)
 export interface ChangePasswordReq {
   phone: string;
   sms_code: string;
   password: string;
 }
 
-// POST /api/v1/auth/sms-code 请求体
 export interface SendSmsCodeReq {
   phone: string;
 }
 
-// 后端 SMS 响应(dev 模式会把验证码放进 data.sms_code)
+// dev 模式会把验证码放进 data.sms_code
 export interface SendSmsCodeResp {
   sms_code?: string;
 }
 
-// 登录成功响应
 export interface LoginSuccessResp {
   logged_in: boolean;
 }
 
-// 当前登录用户资料(GET /users/me,后端 UserResp,见 backend/internal/model/account/dto.go)
-// 注意:Go 侧 Email / AvatarURL / LastLoginAt 带 omitempty,
-//      值为空时这几个字段会整个从 JSON 里消失,所以 TS 用可选
+// 后端 UserResp,见 backend/internal/model/account/dto.go。
+// Go 侧 Email/AvatarURL/LastLoginAt 带 omitempty,值为空时字段整个从 JSON 消失,故 TS 用可选。
 export interface UserResp {
   id: number;
   user_name: string;
@@ -62,8 +55,7 @@ export interface UserResp {
   last_login_at?: string;
 }
 
-// 他人公开资料(GET /users/:id,后端 PublicUserResp)
-// 不含 phone / email / last_login_at —— 后端在这条路径上不会返回联系方式
+// 后端 PublicUserResp(GET /users/:id)。不含 phone/email/last_login_at —— 这条路径后端不返回联系方式。
 export interface PublicUserResp {
   id: number;
   user_name: string;

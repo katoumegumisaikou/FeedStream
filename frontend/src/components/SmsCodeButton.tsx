@@ -2,13 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Button } from 'antd';
 import { sendSmsCode } from '../api/auth';
 
-// SmsCodeButton:发送短信验证码 + 60s 倒计时
-//  - 父组件通过 phone 传入手机号
-//  - 倒计时未归零前按钮 disabled,显示 "Xs 后重试"
-//  - 倒计时归零自动恢复可点击
-//
-// 用法:
-//   <SmsCodeButton phone={phone} onError={(e) => message.error(e)} />
+// 发送短信验证码 + 60s 倒计时,倒计时期间禁用、归零自动恢复
 export interface SmsCodeButtonProps {
   phone: string;
   onError?: (msg: string) => void;

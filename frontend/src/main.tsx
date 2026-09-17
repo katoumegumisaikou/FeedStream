@@ -5,12 +5,7 @@ import { App as AntdApp, ConfigProvider } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import App from './App';
 
-// 入口:
-//  - BrowserRouter 包裹整个应用(支持前端路由)
-//  - ConfigProvider 注入 antd 中文语言包
-//  - AntdApp 提供 message / notification / modal 的上下文感知实例
-//    (App.tsx 用它把 message 注入 axios 拦截器)
-//  - 挂载到 #root
+// AntdApp 提供上下文感知的 message 实例,App.tsx 靠它把 message 注入 axios 拦截器
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ConfigProvider locale={zhCN}>

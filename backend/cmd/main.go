@@ -1,5 +1,4 @@
 // feed_system 后端入口
-// 启动流程:加载配置 → 连接数据库 → 执行迁移 → 连接 Redis → 装配 account 模块 → 启动 HTTP server
 package main
 
 import (
@@ -20,16 +19,12 @@ import (
 	"feed-system/internal/pkg/logger"
 )
 
-// userInfoAdapter 把 account 的用户仓储适配成 video.UserInfoProvider。
-//
-// video 包只声明它需要什么(取作者名和头像),由这里把 account 的实现接上。
-// 这样 video 不必 import account —— 否则两个业务模块双向耦合,
-// 以后 account 想引 video 就成环了
+// userInfoAdapter 把 account 的用户仓储适配成 video.UserInfoProvider,
+// 让 video 不必 import account —— 否则两模块双向耦合,account 再引 video 就成环。
 type userInfoAdapter struct {
 	repo account.UserRepository
 }
 
-// GetAuthorInfo 实现 video.UserInfoProvider
 func (a userInfoAdapter) GetAuthorInfo(ctx context.Context, userID int64) (string, string, error) {
 	u, err := a.repo.FindByID(ctx, userID)
 	if err != nil {
@@ -38,7 +33,6 @@ func (a userInfoAdapter) GetAuthorInfo(ctx context.Context, userID int64) (strin
 	return u.UserName, u.AvatarURL, nil
 }
 
-// getEnv 读环境变量,带默认值
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -46,7 +40,7 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-// getEnvBool 读 bool 环境变量(支持 1/true/yes/TRUE 等大小写),其他值走 fallback
+// getEnvBool 解析 bool 环境变量(1/true/yes/on,大小写均可);其他值走 fallback
 func getEnvBool(key string, fallback bool) bool {
 	v := os.Getenv(key)
 	if v == "" {
@@ -61,26 +55,22 @@ func getEnvBool(key string, fallback bool) bool {
 	return fallback
 }
 
-// main 启动入口
 func main() {
-	// 0. 初始化日志:后续所有输出(含标准库 log)都写入文件
+	// 初始化日志:之后所有输出(含标准库 log)都写入文件
 	closeLog, err := logger.Init(getEnv("LOG_FILE", "logs/app.log"))
 	if err != nil {
 		log.Fatalf("初始化日志失败: %v", err)
 	}
 	defer closeLog()
 
-	// 1. 加载数据库配置
 	cfg := database.LoadConfigFromEnv()
 
-	// 2. 建立数据库连接
 	db, err := database.Open(cfg)
 	if err != nil {
 		log.Fatalf("连接数据库失败: %v", err)
 	}
 	log.Printf("✓ 已连接到 PostgreSQL: %s:%s/%s", cfg.Host, cfg.Port, cfg.DBName)
 
-	// 3. 执行迁移
 	migrator, err := database.NewMigrator(db)
 	if err != nil {
 		log.Fatalf("创建迁移器失败: %v", err)
@@ -90,36 +80,29 @@ func main() {
 	}
 	log.Println("✓ 数据库迁移完成")
 
-	// 4. 连接 Redis(失败不致命,降级为 nil → SMS / 登录锁定不可用,但鉴权仍走 DB)
+	// 连接 Redis:失败不致命,降级为 nil → SMS / 登录锁定不可用,但鉴权仍走 DB
 	rdb := mustRedisClient()
 
-	// 5. 装配 account 模块
 	userRepo := account.NewUserRepository(db)
 	devMode := getEnvBool("SMS_DEV_MODE", true) // 默认 dev 模式:短信验证码会回显给前端
 	accountSvc := account.NewAccountService(userRepo, rdb, devMode)
 	accountHandler := account.NewAccountHandler(accountSvc)
 
-	// 6. 装配 video 模块
-	// 作者信息由 account 的仓储提供,但接口声明在 video 包里 —— 依赖倒置
 	videoSvc := video.NewVideoService(db, rdb, userInfoAdapter{repo: userRepo})
 	videoHandler := video.NewVideoHandler(videoSvc)
 
-	// 7. 创建 gin engine
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
-	// 头像公开访问: /avatars/{userID}/{fileName}
-	// 仅暴露头像存储目录,不暴露项目或其他本地文件。
+	// 头像公开访问 /avatars/{userID}/{fileName}:Static 只暴露头像目录,不含项目其他文件
 	r.Static(account.AvatarURLPrefix, account.AvatarStorageDir)
 	// 视频公开访问: /videos/{userID}/{fileName}
 	r.Static(video.VideoURLPrefix, video.VideoStorageDir)
 
-	// 8. 注册路由(/api/v1/...)
 	v1 := r.Group("/api/v1")
 	account.RegisterRouter(v1, accountHandler, db, rdb)
 	video.RegisterRouter(v1, videoHandler, db, rdb)
 
-	// 9. 启动 HTTP server
 	addr := getEnv("HTTP_ADDR", ":8080")
 	srv := &http.Server{
 		Addr:    addr,
@@ -132,7 +115,7 @@ func main() {
 		}
 	}()
 
-	// 10. 优雅退出:收到信号后给 5 秒做收尾
+	// 优雅退出:收到信号后给 5 秒做收尾
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigCh

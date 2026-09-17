@@ -6,12 +6,7 @@ import SmsCodeButton from '../../components/SmsCodeButton';
 import { register } from '../../api/auth';
 import type { RegisterReq } from '../../types/auth';
 
-// 注册
-//  - user_name:字母开头,字母数字下划线,需含字母(对齐后端 username.Validate)
-//  - password:8-16 位,字母 + 数字 + 特殊字符三类中至少两类(对齐后端 password.Strong)
-//  - phone:11 位手机号
-//  - sms_code:6 位验证码
-//  - email:可选
+// 字段校验与后端对齐:user_name 对齐 username.Validate,password 对齐 password.Strong
 export default function RegisterPage() {
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm<RegisterReq>();
@@ -89,11 +84,11 @@ export default function RegisterPage() {
           rules={[
             { required: true, message: '请输入密码' },
             { min: 8, max: 16, message: '密码 8-16 位' },
-            // 与后端 password.Strong 对齐(字母 + 数字 + 特殊字符 三类中至少两类)
+            // 对齐后端 password.Strong:三类至少两类
             {
               validator: async (_, value: string) => {
                 if (!value) return Promise.resolve();
-                // 与后端 password.Strong 对齐:只允许 ASCII 可打印字符(排除空格)
+                // 只允许 ASCII 可打印字符(排除空格),对齐后端 password.Strong
                 if (!/^[\x21-\x7E]+$/.test(value)) {
                   return Promise.reject(new Error('密码只能使用字母、数字和常见符号'));
                 }

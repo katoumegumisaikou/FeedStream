@@ -1,10 +1,7 @@
 import { ReactNode } from 'react';
 import { Card, Typography } from 'antd';
 
-// AuthLayout:登录 / 注册 / 忘记密码 共用的卡片居中布局
-//  - 全屏居中卡片
-//  - 顶部标题
-//  - children 区域放表单
+// 登录 / 注册 / 忘记密码 共用的居中卡片布局
 export interface AuthLayoutProps {
   title: string;
   children: ReactNode;
