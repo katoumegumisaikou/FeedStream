@@ -522,7 +522,7 @@ func (s *VideoService) CompleteChunkUpload(ctx context.Context, req CompleteChun
 		return nil, errs.ErrInternal.WithMsg("保存视频失败")
 	}
 
-	// 文件已经落盘,后面任何一步失败都要删掉它,避免留下孤儿文件
+	// 文件已经落盘,后面写数据库任何一步失败都要删掉它,避免留下孤儿文件
 	rollback := func() { _ = os.Remove(finalPath) }
 
 	username, avatarURL := "", ""

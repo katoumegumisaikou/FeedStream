@@ -39,7 +39,10 @@ type VideoResp struct {
 }
 
 type InitChunkUploadRequest struct {
-	Filename string `json:"filename" binding:"required"`
+	// max=255 对齐 videos.title 的 VARCHAR(255):这个值会当草稿标题写进库,
+	// 不在 init 拦住的话,用户传完 1GB 才会在建视频行时撞上「value too long」,
+	// 白传一场还看不出原因。varchar 和 validator 的 max 数的都是 rune,口径一致
+	Filename string `json:"filename" binding:"required,max=255"`
 	FileSize int64  `json:"file_size" binding:"required,min=1"` // 文件大小,单位为 Byte
 	// FileHash 客户端算好的 sha256 hex。不做秒传,它只用于合并后校验完整性 ——
 	// 服务端会自己再算一遍比对,对不上就丢弃整个上传
