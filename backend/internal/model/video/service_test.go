@@ -221,3 +221,63 @@ func TestPublishVideo(t *testing.T) {
 		assertCode(t, err, errs.ErrForbidden)
 	})
 }
+
+// TestGetVideoDetail 锁住可见性规则:未发布的一律 404,作者本人除外。
+// 这里是安全相关的 —— 放开了就等于草稿能被遍历 ID 探到
+func TestGetVideoDetail(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("已发布对匿名可见", func(t *testing.T) {
+		v := draftVideo()
+		v.Status = StatusPublished
+		svc, _ := newTestService(v)
+
+		resp, err := svc.GetVideoDetail(ctx, 1, 0) // requesterID 0 = 匿名
+		require.NoError(t, err)
+		assert.Equal(t, int64(1), resp.ID)
+	})
+
+	t.Run("草稿匿名看不到", func(t *testing.T) {
+		svc, _ := newTestService(draftVideo())
+		_, err := svc.GetVideoDetail(ctx, 1, 0)
+		assertCode(t, err, errs.ErrNotFound)
+	})
+
+	t.Run("草稿对非作者看不到", func(t *testing.T) {
+		svc, _ := newTestService(draftVideo())
+		_, err := svc.GetVideoDetail(ctx, 1, 999)
+		assertCode(t, err, errs.ErrNotFound)
+	})
+
+	t.Run("草稿对作者可见", func(t *testing.T) {
+		svc, _ := newTestService(draftVideo())
+
+		resp, err := svc.GetVideoDetail(ctx, 1, testUserID)
+		require.NoError(t, err)
+		assert.Equal(t, StatusDraft, resp.Status)
+	})
+
+	t.Run("已下架匿名看不到但作者可见", func(t *testing.T) {
+		v := draftVideo()
+		v.Status = StatusRemoved
+		svc, _ := newTestService(v)
+
+		_, err := svc.GetVideoDetail(ctx, 1, 0)
+		assertCode(t, err, errs.ErrNotFound)
+
+		_, err = svc.GetVideoDetail(ctx, 1, testUserID)
+		assert.NoError(t, err)
+	})
+
+	t.Run("不存在 404", func(t *testing.T) {
+		svc, _ := newTestService(nil)
+		_, err := svc.GetVideoDetail(ctx, 42, 0)
+		assertCode(t, err, errs.ErrNotFound)
+	})
+
+	t.Run("ID 非法 400", func(t *testing.T) {
+		svc, _ := newTestService(draftVideo())
+		_, err := svc.GetVideoDetail(ctx, 0, 0)
+		assertCode(t, err, errs.ErrInvalidParam)
+	})
+}

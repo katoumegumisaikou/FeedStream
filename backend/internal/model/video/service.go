@@ -537,12 +537,8 @@ func validCoverURL(u string) bool {
 	return strings.HasPrefix(u, CoverURLPrefix+"/") && !strings.Contains(u, "..")
 }
 
-// loadOwnedVideo 取视频并校验归属。
-// 不是作者返回 403 而不是 404:项目其他接口(UploadChunk)也是这个口径,不靠 404 掩盖存在性
-func (s *VideoService) loadOwnedVideo(ctx context.Context, videoID, userID int64) (*Video, error) {
-	if userID <= 0 {
-		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
-	}
+// findVideo 取视频,不存在返回 404,仓储出错记日志并返回 500
+func (s *VideoService) findVideo(ctx context.Context, videoID int64) (*Video, error) {
 	if videoID <= 0 {
 		return nil, errs.ErrInvalidParam.WithMsg("视频 ID 无效")
 	}
@@ -555,10 +551,40 @@ func (s *VideoService) loadOwnedVideo(ctx context.Context, videoID, userID int64
 		slog.ErrorContext(ctx, "查询视频失败", "video_id", videoID, "err", err)
 		return nil, errs.ErrInternal.WithMsg("查询视频失败")
 	}
+	return video, nil
+}
+
+// loadOwnedVideo 取视频并校验归属。
+// 不是作者返回 403 而不是 404:项目其他接口(UploadChunk)也是这个口径,不靠 404 掩盖存在性
+func (s *VideoService) loadOwnedVideo(ctx context.Context, videoID, userID int64) (*Video, error) {
+	if userID <= 0 {
+		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+
+	video, err := s.findVideo(ctx, videoID)
+	if err != nil {
+		return nil, err
+	}
 	if video.AuthorID != userID {
 		return nil, errs.ErrForbidden.WithMsg("无权操作该视频")
 	}
 	return video, nil
+}
+
+// GetVideoDetail 取视频详情(GET /videos/:id)。
+//
+// requesterID 为 0 表示匿名(软鉴权没拿到 token)。
+// 未发布的一律 404,作者本人除外 —— 用 404 而不是 403:403 等于告诉遍历者
+// 「这个 ID 存在」,草稿的 ID 边界就被探出来了
+func (s *VideoService) GetVideoDetail(ctx context.Context, videoID, requesterID int64) (*VideoResp, error) {
+	video, err := s.findVideo(ctx, videoID)
+	if err != nil {
+		return nil, err
+	}
+	if video.Status != StatusPublished && video.AuthorID != requesterID {
+		return nil, errs.ErrNotFound.WithMsg("视频不存在")
+	}
+	return toVideoResp(video), nil
 }
 
 // UpdateVideo 编辑视频元数据(PUT /videos/:id)

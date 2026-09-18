@@ -164,3 +164,19 @@ func (v *VideoHandler) PublishVideo(c *gin.Context) {
 	}
 	response.OK(c, resp)
 }
+
+func (v *VideoHandler) GetVideoDetail(c *gin.Context) {
+	videoID, err := videoIDParam(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	// 软鉴权:匿名没 token 时 UserID 返回 0,可见范围交给 service 决定
+	resp, err := v.svc.GetVideoDetail(c.Request.Context(), videoID, middleware.UserID(c))
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}

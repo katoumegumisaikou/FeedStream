@@ -13,6 +13,7 @@ import (
 var (
 	uploadUserLimit = redis_rate.PerSecond(10)
 	uploadIPLimit   = redis_rate.PerSecond(30)
+	detailIPLimit   = redis_rate.PerMinute(120) // 详情是公开读接口,防按 ID 遍历拖库
 )
 
 // RegisterRouter 把 video 模块的所有路由挂到指定的路由组
@@ -21,10 +22,23 @@ var (
 // Auth 中间件在 internal/middleware 包,只依赖 gorm + redis,不依赖任何业务包,
 // 因此 video → middleware 是单向依赖,不会有循环引用
 func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redis.Client) {
-	// 全部强制登录:UploadChunk / Complete 要拿 userID 校验会话归属
+	// ========== 公开路由(无需登录) ==========
+	// 游客看视频详情不该被要求登录。这里挂 Auth 但**不挂 SetSensitive** = 软鉴权:
+	// 带了合法 token 就注入 userID,没带直接放行。这样作者能用同一个接口看到
+	// 自己的草稿,游客只能看到已发布的 —— 可见范围由 service 判定
+	pub := rg.Group("/videos",
+		middleware.IPRateLimiter(rdb, detailIPLimit),
+		middleware.Auth(db, rdb),
+	)
+	{
+		pub.GET("/:id", h.GetVideoDetail) // 视频详情
+	}
+
+	// ========== 私有路由(全部强制登录) ==========
+	// SetSensitive 保证没 token 直接 401;UploadChunk / Complete 要拿 userID 校验会话归属
 	//
 	// 用 /videos/chunk 前缀而不是散在 /videos 下:gin 允许静态段与通配段共存,
-	// 以后加 GET /videos/:id 不会冲突
+	// 所以上面那个 GET /videos/:id 与这里不冲突
 	//
 	// 限流顺序不能乱:IP 在最前,UserRateLimiter 依赖 Auth 注入的 userID
 	priv := rg.Group("/videos",
