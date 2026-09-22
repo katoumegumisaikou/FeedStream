@@ -56,7 +56,8 @@ func TestLoad(t *testing.T) {
 
 	t.Run("缓存命中时不回源", func(t *testing.T) {
 		cache := newFakeCache()
-		require.NoError(t, cache.Set(ctx, "hit", "cached", time.Minute))
+		// 预置的值必须是 JSON —— sfcache 存进去的是 JSON,手工塞值也得守这个格式
+		require.NoError(t, cache.Set(ctx, "hit", `"cached"`, time.Minute))
 
 		var calls atomic.Int64
 		v, err := Load(ctx, cache, "hit", time.Minute, func(context.Context) (string, error) {
@@ -79,7 +80,8 @@ func TestLoad(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "from-db", v)
 		assert.Equal(t, 1, cache.setCount(), "回源结果应写回缓存")
-		assert.Equal(t, "from-db", cache.data["miss"])
+		// 缓存里放的是 JSON,不是裸值 —— 编解码是包的事,调用方不该看到
+		assert.Equal(t, `"from-db"`, cache.data["miss"])
 	})
 
 	t.Run("cache 为 nil 时只去重不缓存", func(t *testing.T) {
@@ -223,4 +225,104 @@ func TestLoad_发起者取消不连累跟随者(t *testing.T) {
 	<-done   // done 关闭后读 loadCtxErr,时序上安全
 
 	assert.NoError(t, loadCtxErr, "回源用的 ctx 被剥掉了取消,不该跟着发起者一起取消")
+}
+
+// cacheTestTarget 模仿真实调用方缓存的业务结构体
+type cacheTestTarget struct {
+	AuthorID int64 `json:"author_id"`
+	Status   int8  `json:"status"`
+	Found    bool  `json:"found"`
+}
+
+// TestLoad_结构体原样往返 泛型的意义:调用方拿到的是自己的类型,不用手写解析
+func TestLoad_结构体原样往返(t *testing.T) {
+	ctx := context.Background()
+	cache := newFakeCache()
+
+	want := cacheTestTarget{AuthorID: 7, Status: 1, Found: true}
+	got, err := Load(ctx, cache, "struct", time.Minute, func(context.Context) (cacheTestTarget, error) {
+		return want, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	assert.JSONEq(t, `{"author_id":7,"status":1,"found":true}`, cache.data["struct"],
+		"缓存里该是 JSON")
+
+	// 第二次:命中缓存,拿回来的仍是结构体本身,不是 map
+	again, err := Load(ctx, cache, "struct", time.Minute, func(context.Context) (cacheTestTarget, error) {
+		t.Error("第二次该命中缓存,不该回源")
+		return cacheTestTarget{}, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, want, again)
+	assert.Equal(t, int8(1), again.Status, "int8 经 JSON 往返不该丢")
+}
+
+// TestLoad_未导出字段会静默编成空对象 把 Load 文档里那条警告变成可执行的约束。
+//
+// 这是本包唯一一个「不报错但数据是错的」的坑:JSON 看不见未导出字段,
+// 全未导出字段的结构体会被编成 {},命中缓存时解出零值,调用方毫无察觉。
+// 断言的是当前的坏行为 —— 哪天换成能处理未导出字段的编解码,这条会失败,
+// 那正是应该被告知的时刻
+func TestLoad_未导出字段会静默编成空对象(t *testing.T) {
+	type badTarget struct {
+		authorID int64 // 小写 = 未导出,编不出来
+		found    bool
+	}
+	ctx := context.Background()
+	cache := newFakeCache()
+
+	_, err := Load(ctx, cache, "bad", time.Minute, func(context.Context) (badTarget, error) {
+		return badTarget{authorID: 7, found: true}, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "{}", cache.data["bad"], "未导出字段编不出来,而且不会报错")
+
+	got, err := Load(ctx, cache, "bad", time.Minute, func(context.Context) (badTarget, error) {
+		t.Error("不该回源")
+		return badTarget{}, nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, badTarget{}, got, "全零值,且全程没有任何报错")
+}
+
+// TestLoad_同名key被不同类型复用 同一个 key 上换了类型是编码错误。
+// singleflight 会把 leader 的结果发给跟随者,直接断言会 panic ——
+// 这里锁住它被降级成带 key 的 error
+func TestLoad_同名key被不同类型复用(t *testing.T) {
+	var loads atomic.Int64
+
+	started := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// leader:回源慢一点,好让跟随者挤进同一轮
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = Load(context.Background(), nil, "dup-key", time.Minute,
+			func(context.Context) (cacheTestTarget, error) {
+				close(started)
+				time.Sleep(80 * time.Millisecond)
+				loads.Add(1)
+				return cacheTestTarget{AuthorID: 7, Found: true}, nil
+			})
+	}()
+	<-started
+
+	// 跟随者:同一个 key,不同的 T
+	var followerErr error
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, followerErr = Load(context.Background(), nil, "dup-key", time.Minute,
+			func(context.Context) (int64, error) {
+				loads.Add(1)
+				return 42, nil
+			})
+	}()
+	wg.Wait()
+
+	require.Error(t, followerErr, "类型对不上该返回错误,而不是 panic")
+	assert.Contains(t, followerErr.Error(), "dup-key", "错误里要带上 key,否则没法定位")
+	assert.Equal(t, int64(1), loads.Load(), "跟随者该共享 leader 的结果,不回源")
 }
