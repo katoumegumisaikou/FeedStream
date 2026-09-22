@@ -648,6 +648,52 @@ func (s *VideoService) PublishVideo(ctx context.Context, videoID, userID int64) 
 	return toVideoResp(video), nil
 }
 
+// visibleTo 视频对 requesterID 是否可见,requesterID 为 0 表示游客(软鉴权没拿到 token)。
+//
+// 已下架对所有人不可见 —— 含作者本人;草稿 / 转码中 / 转码失败只对作者可见。
+// 文件路由(video.PlayAccess)与上报接口共用这一处口径,改判定只改这里。
+//
+// 注意 GetVideoDetail 仍是另一套口径(作者能看到自己已下架视频的详情):
+// 统一它会改变既有接口的行为,所以先不动,两边的不一致记在这里
+func visibleTo(status int8, authorID, requesterID int64) bool {
+	if status == StatusRemoved {
+		return false
+	}
+	return status == StatusPublished || (requesterID > 0 && authorID == requesterID)
+}
+
+// ReportPlay 记录一次播放(POST /videos/:id/play)。
+//
+// requesterID 为 0 表示游客 —— 游客也记,只是 user_id 落 0(表就是这么设计的)。
+// 可见性口径与文件路由一致:看不见的视频不该被刷记录
+func (s *VideoService) ReportPlay(ctx context.Context, videoID, requesterID int64, req PlayReportReq, ip string) error {
+	video, err := s.findVideo(ctx, videoID)
+	if err != nil {
+		return err
+	}
+	if !visibleTo(video.Status, video.AuthorID, requesterID) {
+		return errs.ErrNotFound.WithMsg("视频不存在")
+	}
+	// 不卡这条的话,前端传 watched > duration 会算出 >100% 的完播率
+	if req.Watched > req.Duration {
+		return errs.ErrInvalidParam.WithMsg("观看时长不能超过视频总时长")
+	}
+
+	rec := &PlayRecord{
+		UserID:   requesterID,
+		VideoID:  videoID,
+		AuthorID: video.AuthorID, // 冗余存一份,按作者聚合时免 JOIN
+		Watched:  req.Watched,
+		Duration: req.Duration,
+		IP:       ip,
+	}
+	if err := s.videorepo.SavePlayReport(ctx, rec); err != nil {
+		slog.ErrorContext(ctx, "记录播放失败", "video_id", videoID, "user_id", requesterID, "err", err)
+		return errs.ErrInternal.WithMsg("记录播放失败")
+	}
+	return nil
+}
+
 // toVideoResp 把 entity 转成对外视图,不暴露 DeletedAt 与 Popularity
 func toVideoResp(v *Video) *VideoResp {
 	if v == nil {

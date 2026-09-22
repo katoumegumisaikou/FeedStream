@@ -14,6 +14,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"feed-system/internal/database"
+	"feed-system/internal/middleware"
 	"feed-system/internal/model/account"
 	"feed-system/internal/model/video"
 	"feed-system/internal/pkg/logger"
@@ -88,7 +89,8 @@ func main() {
 	accountSvc := account.NewAccountService(userRepo, rdb, devMode)
 	accountHandler := account.NewAccountHandler(accountSvc)
 
-	videoSvc := video.NewVideoService(video.NewVideoRepository(db), rdb, userInfoAdapter{repo: userRepo})
+	videoRepo := video.NewVideoRepository(db)
+	videoSvc := video.NewVideoService(videoRepo, rdb, userInfoAdapter{repo: userRepo})
 	videoHandler := video.NewVideoHandler(videoSvc)
 
 	gin.SetMode(gin.ReleaseMode)
@@ -96,8 +98,16 @@ func main() {
 	r.Use(gin.Logger(), gin.Recovery())
 	// 头像公开访问 /avatars/{userID}/{fileName}:Static 只暴露头像目录,不含项目其他文件
 	r.Static(account.AvatarURLPrefix, account.AvatarStorageDir)
-	// 视频公开访问: /videos/{userID}/{fileName}
-	r.Static(video.VideoURLPrefix, video.VideoStorageDir)
+	// 视频公开访问 /videos/{authorID}/{fileName}。
+	//
+	// 不能直接 r.Static:那样请求不经过任何中间件,而静态文件服务不认识「视频状态」,
+	// 草稿和已下架的视频文件谁知道路径谁就能下。挂到组上之后仍然是同一套 http.FileServer
+	// (Range / HEAD / 路径穿越防护都保留),只是多了两道判定:
+	// Auth 软鉴权注入 userID(游客为 0),PlayAccess 按 play_url 反查状态决定放不放行
+	r.Group(video.VideoURLPrefix,
+		middleware.Auth(db, rdb),
+		video.PlayAccess(videoRepo, rdb),
+	).Static("", video.VideoStorageDir)
 	// 封面公开访问: /covers/{fileName}。
 	// 目录现在还是空的 —— 封面上传接口尚未实现,挂在这里是为了让入库的 cover_url 有落点
 	r.Static(video.CoverURLPrefix, video.CoverStorageDir)

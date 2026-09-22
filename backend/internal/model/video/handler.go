@@ -180,3 +180,27 @@ func (v *VideoHandler) GetVideoDetail(c *gin.Context) {
 	}
 	response.OK(c, resp)
 }
+
+func (v *VideoHandler) ReportPlay(c *gin.Context) {
+	videoID, err := videoIDParam(c)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+
+	var req PlayReportReq
+	if err := c.ShouldBindBodyWithJSON(&req); err != nil {
+		response.Error(c, errs.ErrInvalidParam)
+		return
+	}
+
+	// 软鉴权:游客 UserID 为 0,照样记录。不像上传那几个接口那样拦 0 —— 那是全项目
+	// 唯一「未登录也算合法」的写入口。
+	// ip 取 RemoteIP 不取 ClientIP:后者信任 X-Forwarded-For,那条头是客户端能自己填的
+	err = v.svc.ReportPlay(c.Request.Context(), videoID, middleware.UserID(c), req, c.RemoteIP())
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, nil)
+}

@@ -15,11 +15,15 @@ type UpdateVideoReq struct {
 	CoverURL    string `json:"cover_url"   binding:"omitempty,max=255"` // 留空表示不改动现有封面
 }
 
-// PlayReportReq 播放上报请求
+// PlayReportReq 播放上报请求(POST /videos/:id/play)。
+//
+// 不含 video_id:ID 走路径参数。路径和 body 都能带的话,两者不一致时以谁为准
+// 就成了 bug 温床 —— 详情 / 编辑 / 发布也都是从路径取 ID。
+//
+// 两个字段都要 min=0:不卡的话前端传负数能过,完播率会算出负值
 type PlayReportReq struct {
-	VideoID  int64 `json:"video_id" binding:"required"`
-	Watched  int   `json:"watched"`  // 实际观看秒数
-	Duration int   `json:"duration"` // 总时长(秒),用于算完播率
+	Watched  int `json:"watched"  binding:"min=0"` // 实际观看秒数
+	Duration int `json:"duration" binding:"min=0"` // 总时长(秒),用于算完播率
 }
 
 // VideoResp 视频视图

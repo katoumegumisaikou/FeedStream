@@ -16,6 +16,16 @@ type VideoRepository interface {
 	// FindVideoByID 按主键查,查不到返回 ErrNotFound
 	FindVideoByID(ctx context.Context, id int64) (*Video, error)
 
+	// FindVideoByPlayURL 按播放地址反查,查不到返回 ErrNotFound。
+	// 公开文件路由只有 URL 没有 ID,靠它拿到视频状态才能判可见性(走 006 迁移的
+	// idx_videos_play_url,是索引命中不是全表扫)
+	FindVideoByPlayURL(ctx context.Context, playURL string) (*Video, error)
+
+	// SavePlayReport 在一个事务里追加一条播放流水,并把 videos.play_count 加一。
+	// 两件事必须同生共死:流水是明细、play_count 是读列表直接用的聚合,
+	// 只成一件就会出现「有明细没计数」这种对不上的漂移
+	SavePlayReport(ctx context.Context, r *PlayRecord) error
+
 	// UpdateVideoFields 只更新传入的列,updated_at 由 GORM 自动填。
 	// 用 map 而不是 struct:struct 更新会跳过零值,把 Description 清空成 "" 就写不进库
 	UpdateVideoFields(ctx context.Context, id int64, fields map[string]any) error
@@ -53,6 +63,32 @@ func (r *videoRepository) FindVideoByID(ctx context.Context, id int64) (*Video, 
 		return nil, err
 	}
 	return &v, nil
+}
+
+func (r *videoRepository) FindVideoByPlayURL(ctx context.Context, playURL string) (*Video, error) {
+	var v Video
+	err := r.db.WithContext(ctx).Where("play_url = ?", playURL).First(&v).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &v, nil
+}
+
+// SavePlayReport 流水与计数必须一起成功,所以包一个事务:
+// 分开写会在中间失败时留下「有明细没计数」的漂移,而 play_count 没有自愈途径
+func (r *videoRepository) SavePlayReport(ctx context.Context, rec *PlayRecord) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(rec).Error; err != nil {
+			return err
+		}
+		return tx.Model(&Video{}).
+			Where("id = ?", rec.VideoID).
+			// UpdateColumn 而非 Update:播放数涨了不等于内容被改动,不该顺带顶掉 updated_at
+			UpdateColumn("play_count", gorm.Expr("play_count + 1")).Error
+	})
 }
 
 func (r *videoRepository) UpdateVideoFields(ctx context.Context, id int64, fields map[string]any) error {
