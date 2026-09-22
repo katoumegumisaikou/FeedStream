@@ -116,6 +116,7 @@ Thumbs.db
 .project
 .classpath
 .settings/
+.codebuddy/
 
 # ============================================================
 # 操作系统
