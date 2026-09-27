@@ -59,43 +59,18 @@ func Auth(db *gorm.DB, rdb *redis.Client) gin.HandlerFunc {
 	}
 }
 
-// versionCache 把 Redis 适配成 sfcache.Cache。
-// Redis 存的本来就是字符串,所以这里不需要额外编解码
-//
-// 读失败一律当作未命中(含 redis.Nil 和真故障):
-// Redis 挂了不该让鉴权跟着挂,回源 DB 即可。
-// 「值不是数字」这类脏数据不在这里管 —— sfcache 解不开会当未命中回源,同样能自愈
-type versionCache struct{ rdb *redis.Client }
-
-func (c versionCache) Get(ctx context.Context, key string) (string, error) {
-	if c.rdb == nil {
-		return "", sfcache.ErrMiss
-	}
-	raw, err := c.rdb.Get(ctx, key).Result()
-	if err != nil {
-		return "", sfcache.ErrMiss
-	}
-	return raw, nil
-}
-
-func (c versionCache) Set(ctx context.Context, key, value string, ttl time.Duration) error {
-	if c.rdb == nil {
-		return nil
-	}
-	return c.rdb.Set(ctx, key, value, ttl).Err()
-}
-
 // checkUserVersion 比对 token 中的 version 与 DB 当前 version,不一致则 401 ——
 // 改密 / 注销会改 version,使旧 token 失效。
 // 缓存优先,miss 时回源 DB 并回写;同一用户的并发回源会被合并成一次。
 // 返回 false 表示已 abort,调用方直接 return。
 //
 // 走包级 sfcache.Load:它用的是进程级唯一去重域,所以并发去重不依赖调用方
-// 维护什么生命周期。key 自带 feed:user:version: 前缀,不会和别的业务撞
+// 维护什么生命周期。key 自带 feed:user:version: 前缀,不会和别的业务撞。
+// Redis 不可用时 sfcache 会降级回源 DB,鉴权不会跟着挂
 func checkUserVersion(c *gin.Context, db *gorm.DB, rdb *redis.Client, userID, tokenVersion int64) bool {
 	ctx := c.Request.Context()
 
-	dbVersion, err := sfcache.Load(ctx, versionCache{rdb: rdb}, userVersionKey(userID), versionCacheTTL,
+	dbVersion, err := sfcache.Load(ctx, rdb, userVersionKey(userID), versionCacheTTL,
 		func(loadCtx context.Context) (int64, error) {
 			var v int64
 			if err := db.WithContext(loadCtx).

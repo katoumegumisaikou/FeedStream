@@ -40,13 +40,11 @@ type playTarget struct {
 //
 // 必须挂在 middleware.Auth 之后 —— 它靠 userID 判「是不是作者」
 func PlayAccess(repo VideoRepository, rdb *redis.Client) gin.HandlerFunc {
-	cache := playAccessCache{rdb: rdb}
-
 	return func(c *gin.Context) {
 		// 组的 URL 前缀 + 通配段正好还原出入库时的 play_url,反查才能走索引
 		playURL := VideoURLPrefix + c.Param("filepath")
 
-		target, err := sfcache.Load(c.Request.Context(), cache, playURLKey(playURL), playAccessCacheTTL,
+		target, err := sfcache.Load(c.Request.Context(), rdb, playURLKey(playURL), playAccessCacheTTL,
 			func(loadCtx context.Context) (playTarget, error) {
 				v, err := repo.FindVideoByPlayURL(loadCtx, playURL)
 				if errors.Is(err, ErrNotFound) {
@@ -79,27 +77,4 @@ func PlayAccess(repo VideoRepository, rdb *redis.Client) gin.HandlerFunc {
 // 撞 key 会把别的业务的结果发给本业务
 func playURLKey(playURL string) string {
 	return "video:play_url:" + playURL
-}
-
-// playAccessCache 把 Redis 适配成 sfcache.Cache。Redis 存的本来就是字符串,
-// 这里不需要任何编解码 —— 那是 sfcache 的事
-type playAccessCache struct{ rdb *redis.Client }
-
-// Get 一律把读失败当未命中:Redis 挂了不该让文件服务跟着挂,回源 DB 即可
-func (c playAccessCache) Get(ctx context.Context, key string) (string, error) {
-	if c.rdb == nil {
-		return "", sfcache.ErrMiss
-	}
-	raw, err := c.rdb.Get(ctx, key).Result()
-	if err != nil {
-		return "", sfcache.ErrMiss
-	}
-	return raw, nil
-}
-
-func (c playAccessCache) Set(ctx context.Context, key, value string, ttl time.Duration) error {
-	if c.rdb == nil {
-		return nil
-	}
-	return c.rdb.Set(ctx, key, value, ttl).Err()
 }

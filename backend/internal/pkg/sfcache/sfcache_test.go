@@ -8,59 +8,35 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// fakeCache 内存版 Cache,记录回写次数,便于断言「有没有真的回源」
-type fakeCache struct {
-	mu     sync.Mutex
-	data   map[string]string
-	getErr error // 非 nil 时 Get 直接返回它(模拟缓存故障)
-	sets   int
-}
-
-func newFakeCache() *fakeCache {
-	return &fakeCache{data: map[string]string{}}
-}
-
-func (c *fakeCache) Get(ctx context.Context, key string) (string, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.getErr != nil {
-		return "", c.getErr
-	}
-	v, ok := c.data[key]
-	if !ok {
-		return "", ErrMiss
-	}
-	return v, nil
-}
-
-func (c *fakeCache) Set(ctx context.Context, key, value string, ttl time.Duration) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.data[key] = value
-	c.sets++
-	return nil
-}
-
-func (c *fakeCache) setCount() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.sets
+// newTestRedis 起一个内存 Redis 并返回客户端与它的直接句柄。
+//
+// 本包现在直连 *redis.Client,测试也走真实协议 —— 好处是「命令有没有拼对」这类
+// 问题才测得出来。mr 用来绕过协议预置/读取值,不用写一遍 GET。
+//
+// 代价:回写「次数」数不出来(miniredis 没有命令计数),只能断言值对不对。
+// 需要断言次数的用例都改成断言「回源次数」,那才是要守的东西
+func newTestRedis(t *testing.T) (*redis.Client, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	return redis.NewClient(&redis.Options{Addr: mr.Addr()}), mr
 }
 
 func TestLoad(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("缓存命中时不回源", func(t *testing.T) {
-		cache := newFakeCache()
-		// 预置的值必须是 JSON —— sfcache 存进去的是 JSON,手工塞值也得守这个格式
-		require.NoError(t, cache.Set(ctx, "hit", `"cached"`, time.Minute))
+		rdb, mr := newTestRedis(t)
+		// 预置的值必须是 JSON —— sfcache 存进去的就是 JSON,手工塞值也得守这个格式
+		require.NoError(t, mr.Set("hit", `"cached"`))
 
 		var calls atomic.Int64
-		v, err := Load(ctx, cache, "hit", time.Minute, func(context.Context) (string, error) {
+		v, err := Load(ctx, rdb, "hit", time.Minute, func(context.Context) (string, error) {
 			calls.Add(1)
 			return "from-db", nil
 		})
@@ -71,20 +47,21 @@ func TestLoad(t *testing.T) {
 	})
 
 	t.Run("未命中时回源并回写缓存", func(t *testing.T) {
-		cache := newFakeCache()
+		rdb, mr := newTestRedis(t)
 
-		v, err := Load(ctx, cache, "miss", time.Minute, func(context.Context) (string, error) {
+		v, err := Load(ctx, rdb, "miss", time.Minute, func(context.Context) (string, error) {
 			return "from-db", nil
 		})
 
 		require.NoError(t, err)
 		assert.Equal(t, "from-db", v)
-		assert.Equal(t, 1, cache.setCount(), "回源结果应写回缓存")
 		// 缓存里放的是 JSON,不是裸值 —— 编解码是包的事,调用方不该看到
-		assert.Equal(t, `"from-db"`, cache.data["miss"])
+		stored, err := mr.Get("miss")
+		require.NoError(t, err, "回源结果应写回缓存")
+		assert.Equal(t, `"from-db"`, stored)
 	})
 
-	t.Run("cache 为 nil 时只去重不缓存", func(t *testing.T) {
+	t.Run("rdb 为 nil 时只去重不缓存", func(t *testing.T) {
 		v, err := Load(ctx, nil, "nocache", time.Minute, func(context.Context) (string, error) {
 			return "from-db", nil
 		})
@@ -92,18 +69,21 @@ func TestLoad(t *testing.T) {
 		assert.Equal(t, "from-db", v)
 	})
 
-	t.Run("缓存故障不当成未命中", func(t *testing.T) {
-		cache := newFakeCache()
-		cache.getErr = errors.New("redis down")
+	// 这条锁的是降级策略:Redis 挂了不该把鉴权、文件路由一起带下去。
+	// 宁可每次都回源(慢),也不要整站 401/404
+	t.Run("缓存故障降级回源,不把错误抛给调用方", func(t *testing.T) {
+		rdb, mr := newTestRedis(t)
+		mr.SetError("MASTERDOWN Link with MASTER is down")
 
 		var calls atomic.Int64
-		_, err := Load(ctx, cache, "broken", time.Minute, func(context.Context) (string, error) {
+		v, err := Load(ctx, rdb, "broken", time.Minute, func(context.Context) (string, error) {
 			calls.Add(1)
-			return "x", nil
+			return "from-db", nil
 		})
 
-		assert.Error(t, err)
-		assert.Equal(t, int64(0), calls.Load(), "缓存故障该直接报错,而不是偷偷回源")
+		require.NoError(t, err, "缓存故障不该让调用方拿到错误")
+		assert.Equal(t, "from-db", v)
+		assert.Equal(t, int64(1), calls.Load(), "缓存故障该回源")
 	})
 }
 
@@ -114,7 +94,7 @@ func TestLoad(t *testing.T) {
 // 没有句柄可以拿,所以不存在「在调用点新建一个域、把去重关掉」这种写法
 func TestLoad_并发去重(t *testing.T) {
 	const n = 50
-	cache := newFakeCache()
+	rdb, mr := newTestRedis(t)
 
 	var calls atomic.Int64
 	results := make([]string, n)
@@ -127,7 +107,7 @@ func TestLoad_并发去重(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			results[i], errsCh[i] = Load(context.Background(), cache, "concurrent", time.Minute,
+			results[i], errsCh[i] = Load(context.Background(), rdb, "concurrent", time.Minute,
 				func(context.Context) (string, error) {
 					calls.Add(1)
 					time.Sleep(50 * time.Millisecond) // 拉宽窗口,保证跟随者都在飞行中到达
@@ -143,7 +123,11 @@ func TestLoad_并发去重(t *testing.T) {
 		require.NoError(t, errsCh[i])
 		assert.Equal(t, "shared", results[i], "所有请求者应拿到同一份结果")
 	}
-	assert.Equal(t, 1, cache.setCount(), "回写也该只发生一次")
+	// 回写次数数不出来(miniredis 不计数),这里只验写进去了且值正确。
+	// 「只回源一次」才是这条用例真正守的东西,那个由上面的 calls 断言
+	stored, err := mr.Get("concurrent")
+	require.NoError(t, err)
+	assert.Equal(t, `"shared"`, stored)
 }
 
 func TestLoad_不同key互不影响(t *testing.T) {
@@ -170,7 +154,7 @@ func TestLoad_不同key互不影响(t *testing.T) {
 
 func TestLoad_失败也被共享(t *testing.T) {
 	const n = 20
-	cache := newFakeCache()
+	rdb, mr := newTestRedis(t)
 
 	var calls atomic.Int64
 	start := make(chan struct{})
@@ -182,7 +166,7 @@ func TestLoad_失败也被共享(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			_, errsCh[i] = Load(context.Background(), cache, "boom", time.Minute,
+			_, errsCh[i] = Load(context.Background(), rdb, "boom", time.Minute,
 				func(context.Context) (string, error) {
 					calls.Add(1)
 					time.Sleep(50 * time.Millisecond)
@@ -197,7 +181,7 @@ func TestLoad_失败也被共享(t *testing.T) {
 	for i := range n {
 		assert.Error(t, errsCh[i])
 	}
-	assert.Equal(t, 0, cache.setCount(), "失败结果不该写进缓存")
+	assert.False(t, mr.Exists("boom"), "失败结果不该写进缓存")
 }
 
 // TestLoad_发起者取消不连累跟随者 锁住 context.WithoutCancel 那条:
@@ -237,19 +221,21 @@ type cacheTestTarget struct {
 // TestLoad_结构体原样往返 泛型的意义:调用方拿到的是自己的类型,不用手写解析
 func TestLoad_结构体原样往返(t *testing.T) {
 	ctx := context.Background()
-	cache := newFakeCache()
+	rdb, mr := newTestRedis(t)
 
 	want := cacheTestTarget{AuthorID: 7, Status: 1, Found: true}
-	got, err := Load(ctx, cache, "struct", time.Minute, func(context.Context) (cacheTestTarget, error) {
+	got, err := Load(ctx, rdb, "struct", time.Minute, func(context.Context) (cacheTestTarget, error) {
 		return want, nil
 	})
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
-	assert.JSONEq(t, `{"author_id":7,"status":1,"found":true}`, cache.data["struct"],
-		"缓存里该是 JSON")
+
+	stored, err := mr.Get("struct")
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"author_id":7,"status":1,"found":true}`, stored, "缓存里该是 JSON")
 
 	// 第二次:命中缓存,拿回来的仍是结构体本身,不是 map
-	again, err := Load(ctx, cache, "struct", time.Minute, func(context.Context) (cacheTestTarget, error) {
+	again, err := Load(ctx, rdb, "struct", time.Minute, func(context.Context) (cacheTestTarget, error) {
 		t.Error("第二次该命中缓存,不该回源")
 		return cacheTestTarget{}, nil
 	})
@@ -270,15 +256,18 @@ func TestLoad_未导出字段会静默编成空对象(t *testing.T) {
 		found    bool
 	}
 	ctx := context.Background()
-	cache := newFakeCache()
+	rdb, mr := newTestRedis(t)
 
-	_, err := Load(ctx, cache, "bad", time.Minute, func(context.Context) (badTarget, error) {
+	_, err := Load(ctx, rdb, "bad", time.Minute, func(context.Context) (badTarget, error) {
 		return badTarget{authorID: 7, found: true}, nil
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "{}", cache.data["bad"], "未导出字段编不出来,而且不会报错")
 
-	got, err := Load(ctx, cache, "bad", time.Minute, func(context.Context) (badTarget, error) {
+	stored, err := mr.Get("bad")
+	require.NoError(t, err)
+	assert.Equal(t, "{}", stored, "未导出字段编不出来,而且不会报错")
+
+	got, err := Load(ctx, rdb, "bad", time.Minute, func(context.Context) (badTarget, error) {
 		t.Error("不该回源")
 		return badTarget{}, nil
 	})
