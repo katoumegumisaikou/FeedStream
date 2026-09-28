@@ -16,11 +16,12 @@ import (
 	"strings"
 	"time"
 
-	"feed-system/internal/pkg/errs"
-	"feed-system/internal/util/filetype"
-
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
+
+	"feed-system/internal/pkg/errs"
+	"feed-system/internal/pkg/sfcache"
+	"feed-system/internal/util/filetype"
 )
 
 // MaxVideoSize 单个视频文件上限:1 GiB(1024^3 字节)。
@@ -666,6 +667,13 @@ func visibleTo(status int8, authorID, requesterID int64) bool {
 //
 // requesterID 为 0 表示游客 —— 游客也记,只是 user_id 落 0(表就是这么设计的)。
 // 可见性口径与文件路由一致:看不见的视频不该被刷记录
+//
+// TODO(幂等): 现在是无条件追加,同一请求重发(前端重试、刷新、sendBeacon 在 pagehide
+// 上重复触发)都会再插一行并把 play_count 重复加一。修法是给每次观看一个会话 id:
+// 客户端上报时带上,表加 UNIQUE (user_id, session_id),插入用 ON CONFLICT DO NOTHING
+// 判「是不是这次会话的第一次」,冲突则只把 watched 往大里更新(进度不倒退)。
+// 索引必须带 user_id —— session_id 是客户端传的,只对它建唯一索引的话,
+// 攻击者指定别人的 session_id 就能覆盖掉别人的记录
 func (s *VideoService) ReportPlay(ctx context.Context, videoID, requesterID int64, req PlayReportReq, ip string) error {
 	video, err := s.findVideo(ctx, videoID)
 	if err != nil {
@@ -714,4 +722,164 @@ func toVideoResp(v *Video) *VideoResp {
 		LikesCount:   v.LikesCount,
 		CommentCount: v.CommentCount,
 	}
+}
+
+// latestVideosKey 最新流的 ZSET key。全局只有一个,不按参数拼
+// (其余 key 见 uploadBitmapKey / uploadDeclarationKey / mergeLockKey)
+const latestVideosKey = "feed:video:latest"
+
+// latestVideosTTL 最新流 ZSET 的存活时间。到期整个 ZSET 消失,下次请求重新回填 ——
+// 这就是「新发布的视频最多 1 小时不出现」的失效策略
+const latestVideosTTL = time.Hour
+
+// latestBackfillSize 回填 ZSET 时一次取多少条,也是缓存能覆盖的最大范围。
+// 和 defaultLatestLimit 含义不同(那是「一页给前端多少条」)
+const latestBackfillSize = 500
+
+// defaultLatestLimit 前端不传 limit 时的默认页大小
+const defaultLatestLimit = 100
+
+func (s *VideoService) ListLatest(ctx context.Context, req ListLatestReq) (*ListLatestResp, error) {
+	if s.rdb == nil {
+		return nil, errs.ErrInternalCache
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		// 只补缺省。范围校验在 handler 的 binding —— 非法值到不了这,
+		// 在这里再写一遍就是永远不成立的死代码
+		limit = defaultLatestLimit
+	}
+
+	// 取缓存里最旧的一条,只为判断 ZSET 空不空
+	oldest, err := s.rdb.ZRangeWithScores(ctx, latestVideosKey, 0, 0).Result()
+	if err != nil {
+		return nil, errs.ErrInternal
+	}
+
+	var result []*VideoResp
+	if len(oldest) == 0 {
+		// 缓存是空的,回源 DB 取最新的一批填进去。
+		//
+		// sfcache 的 rdb 传 nil:这里只要它的并发去重(避免缓存失效瞬间一堆请求
+		// 同时打库),不要它的缓存 —— 缓存是下面那个 ZSET。一个 Redis key 不能
+		// 同时是 string 和 zset,让 sfcache 往同一个 key 上 SET 会直接撞类型
+		videos, err := sfcache.Load(ctx, nil, latestVideosKey, time.Minute,
+			func(loadCtx context.Context) ([]*Video, error) {
+				videos, err := s.videorepo.ListLatestVideos(loadCtx, time.Now(), latestBackfillSize)
+				if err != nil {
+					return nil, errs.ErrInternal
+				}
+				return videos, nil
+			})
+		if err != nil {
+			return nil, errs.ErrInternal
+		}
+
+		members := make([]redis.Z, 0, len(videos))
+		for _, video := range videos {
+			card := toVideoResp(video)
+			result = append(result, card)
+
+			m, err := json.Marshal(card)
+			if err != nil {
+				slog.WarnContext(ctx, "最新流成员序列化失败,跳过", "video_id", video.ID, "err", err)
+				continue
+			}
+			// score 只用来排序,秒级够用:人工上传,同一秒发布两条的概率可忽略,
+			// 撞分时 ZSET 按 member 字典序排,顺序会乱但不会丢。
+			// 分页精度不依赖它 —— cursor 取的是 member 里的 created_at
+			members = append(members, redis.Z{
+				Score:  float64(video.CreatedAt.Unix()),
+				Member: m,
+			})
+		}
+
+		// members 为空时不能 ZAdd:Redis 会按参数个数报错,而「一条已发布的视频
+		// 都没有」是合法状态(冷启动),不该因此 500
+		if len(members) > 0 {
+			// ZAdd 与 Expire 必须同一次执行:分开写的话,进程恰好在两者之间挂掉
+			// 会留下一个没有 TTL 的 ZSET —— 而读取判据是「非空就用」,
+			// 于是最新流永远不再回填,新视频永远不出现
+			pipe := s.rdb.TxPipeline()
+			pipe.ZAdd(ctx, latestVideosKey, members...)
+			pipe.Expire(ctx, latestVideosKey, latestVideosTTL)
+			if _, err := pipe.Exec(ctx); err != nil {
+				return nil, errs.ErrInternal
+			}
+		}
+	} else {
+		// 缓存里是倒序的,取最前面一批。索引模式两端都含,所以 stop 是 size-1
+		zSlice, err := s.rdb.ZRevRangeWithScores(ctx, latestVideosKey, 0, int64(latestBackfillSize)-1).Result()
+		if err != nil {
+			return nil, errs.ErrInternal
+		}
+		for _, z := range zSlice {
+			var item VideoResp
+			if err := json.Unmarshal([]byte(z.Member.(string)), &item); err != nil {
+				// 混进写脏的成员时跳过。静默会表现成「这一页莫名少几条」,留条日志
+				slog.WarnContext(ctx, "最新流缓存里有解不开的成员", "err", err)
+				continue
+			}
+			result = append(result, &item)
+		}
+	}
+
+	// cursor 是上一页最后一条的秒级时间戳(见 ListLatestReq);首页(0)取当前时刻
+	cursorSeconds := req.Cursor
+	if cursorSeconds == 0 {
+		cursorSeconds = time.Now().Unix()
+	}
+	cursor := time.Unix(cursorSeconds, 0)
+
+	// 空页也要是 [] 而不是 null,前端才不用判空(见 ListLatestResp 注释)
+	resp := ListLatestResp{Items: []VideoResp{}}
+	// 用热数据中最早的视频作为缓存边界;边界之前的数据属于冷数据。
+	var oldestCachedAt time.Time
+	for _, item := range result {
+		if item != nil && (oldestCachedAt.IsZero() || item.CreatedAt.Before(oldestCachedAt)) {
+			oldestCachedAt = item.CreatedAt
+		}
+	}
+
+	// 缓存覆盖的是 [最旧, 最新] 这一段。cursor 不晚于最旧那条,说明要的数据比
+	// 缓存还旧,缓存给不了,回源 DB
+	if len(result) == 0 || !cursor.After(oldestCachedAt) {
+		videos, err := s.videorepo.ListLatestVideos(ctx, cursor, limit)
+		if err != nil {
+			slog.ErrorContext(ctx, "查询最新流失败", "cursor", cursor, "err", err)
+			return nil, errs.ErrInternal.WithMsg("查询最新流失败")
+		}
+		for _, video := range videos {
+			resp.Items = append(resp.Items, *toVideoResp(video))
+		}
+	} else {
+		// 热数据:result 已是时间倒序,挑出 cursor 之前的取前 limit 条
+		for _, item := range result {
+			if len(resp.Items) >= limit {
+				break
+			}
+			if item.CreatedAt.Before(cursor) {
+				resp.Items = append(resp.Items, *item)
+			}
+		}
+
+		// 热数据已经用完但本页还不满时,从缓存边界之前查冷数据补足。
+		if len(resp.Items) < limit {
+			remaining := limit - len(resp.Items)
+			videos, err := s.videorepo.ListLatestVideos(ctx, oldestCachedAt, remaining)
+			if err != nil {
+				return nil, errs.ErrInternal.WithMsg("查询最新流失败")
+			}
+			for _, video := range videos {
+				resp.Items = append(resp.Items, *toVideoResp(video))
+			}
+		}
+	}
+
+	// 下一跳的游标取这一页最后一条;0 表示没有更多
+	if n := len(resp.Items); n > 0 {
+		resp.NextCursor = resp.Items[n-1].CreatedAt.Unix()
+	}
+	return &resp, nil
 }

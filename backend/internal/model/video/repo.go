@@ -3,6 +3,7 @@ package video
 import (
 	"context"
 	"errors"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -20,6 +21,14 @@ type VideoRepository interface {
 	// 公开文件路由只有 URL 没有 ID,靠它拿到视频状态才能判可见性(走 006 迁移的
 	// idx_videos_play_url,是索引命中不是全表扫)
 	FindVideoByPlayURL(ctx context.Context, playURL string) (*Video, error)
+
+	// ListLatestVideos 取发布时间早于 before 的最新 limit 条已发布视频,按时间倒序。
+	//
+	// before 由调用方给:首页传 time.Now(),翻页传上一页最后一条的 created_at。
+	// 这样仓库里只有一条查询路径,不用为「首页」多分一个分支出来。
+	// 只返回已发布(草稿/下架不进公开流)。
+	// 走 003 迁移的 idx_videos_create_time(created_at DESC),是索引范围扫描
+	ListLatestVideos(ctx context.Context, before time.Time, limit int) ([]*Video, error)
 
 	// SavePlayReport 在一个事务里追加一条播放流水,并把 videos.play_count 加一。
 	// 两件事必须同生共死:流水是明细、play_count 是读列表直接用的聚合,
@@ -75,6 +84,24 @@ func (r *videoRepository) FindVideoByPlayURL(ctx context.Context, playURL string
 		return nil, err
 	}
 	return &v, nil
+}
+
+// ListLatestVideos 不加 deleted_at 条件:GORM 认出 Video 里嵌的 gorm.DeletedAt
+// 会自动补上软删除过滤,手写一遍就是两份会漂移的真相
+//
+// limit 直接透给 GORM,注意它的边界语义:Limit(0) 拼出 LIMIT 0(空集),
+// 而 Limit(负数) 是「不加 LIMIT」—— 会静默拉全表。调用方必须保证 limit > 0
+func (r *videoRepository) ListLatestVideos(ctx context.Context, before time.Time, limit int) ([]*Video, error) {
+	var videos []*Video
+	err := r.db.WithContext(ctx).
+		Where("status = ? AND created_at < ?", StatusPublished, before).
+		Order("created_at DESC").
+		Limit(limit).
+		Find(&videos).Error
+	if err != nil {
+		return nil, err
+	}
+	return videos, nil
 }
 
 // SavePlayReport 流水与计数必须一起成功,所以包一个事务:

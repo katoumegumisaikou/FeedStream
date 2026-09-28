@@ -204,3 +204,18 @@ func (v *VideoHandler) ReportPlay(c *gin.Context) {
 	}
 	response.OK(c, nil)
 }
+
+func (v *VideoHandler) ListLatest(c *gin.Context) {
+	var req ListLatestReq
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Error(c, errs.ErrInvalidParam.WithMsg("查询参数无效"))
+		return
+	}
+
+	resp, err := v.svc.ListLatest(c.Request.Context(), req)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
