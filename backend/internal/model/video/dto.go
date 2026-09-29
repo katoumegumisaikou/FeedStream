@@ -42,29 +42,7 @@ type VideoResp struct {
 	PlayCount    int64     `json:"play_count"`
 	LikesCount   int64     `json:"likes_count"`
 	CommentCount int64     `json:"comment_count"`
-}
-
-// ListLatestReq 最新流查询参数(GET /videos/latest)。
-// 用 cursor 而非 offset —— offset 在翻页期间有新视频发布会漏条/重复,
-// cursor 锚住上一页最后一条的发布时间,不受新增影响
-type ListLatestReq struct {
-	// Limit 每页条数。0 由 service 补默认值;max=100 卡住「一次拉全表」
-	Limit int `form:"limit" binding:"omitempty,min=1,max=100"`
-	// Cursor 上一页返回的 next_cursor(Unix 秒),首页不传。
-	// 秒级精度会漏掉同一秒内尚未返回的视频;当前业务接受这个精度损失。
-	Cursor int64 `form:"cursor" binding:"omitempty,min=0"`
-}
-
-// ListLatestResp 最新流响应。
-//
-// 不带 has_more:next_cursor 为 0 就等价于「没有更多」,
-// 两个字段表达同一件事只会让前端不知道该信哪个
-type ListLatestResp struct {
-	// Items 视频卡片,按发布时间倒序。
-	// service 必须保证它非 nil(空页返回 [] 而不是 null),前端就不用判空
-	Items []VideoResp `json:"items"`
-	// NextCursor 下一页游标(Unix 秒);0 表示没有更多
-	NextCursor int64 `json:"next_cursor"`
+	IsLike       *bool     `json:"is_like,omitempty"` // nil 表示匿名或未计算
 }
 
 type InitChunkUploadRequest struct {

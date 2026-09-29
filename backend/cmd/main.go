@@ -16,6 +16,7 @@ import (
 	"feed-system/internal/database"
 	"feed-system/internal/middleware"
 	"feed-system/internal/model/account"
+	"feed-system/internal/model/feed"
 	"feed-system/internal/model/video"
 	"feed-system/internal/pkg/logger"
 )
@@ -92,6 +93,9 @@ func main() {
 	videoRepo := video.NewVideoRepository(db)
 	videoSvc := video.NewVideoService(videoRepo, rdb, userInfoAdapter{repo: userRepo})
 	videoHandler := video.NewVideoHandler(videoSvc)
+	feedRepo := feed.NewFeedRepository(db)
+	feedSvc := feed.NewFeedService(feedRepo, rdb, videoSvc)
+	feedHandler := feed.NewFeedHandler(feedSvc)
 
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -114,6 +118,8 @@ func main() {
 
 	v1 := r.Group("/api/v1")
 	account.RegisterRouter(v1, accountHandler, db, rdb)
+	// 先注册 feed 的 /videos/latest,避免被 video 的 /videos/:id 参数路由匹配。
+	feed.RegisterRouter(v1, feedHandler, db, rdb)
 	video.RegisterRouter(v1, videoHandler, db, rdb)
 
 	addr := getEnv("HTTP_ADDR", ":8080")

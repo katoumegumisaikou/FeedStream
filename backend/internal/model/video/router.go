@@ -31,7 +31,6 @@ func RegisterRouter(rg *gin.RouterGroup, h *VideoHandler, db *gorm.DB, rdb *redi
 		middleware.Auth(db, rdb),
 	)
 	{
-		pub.GET("/latest", h.ListLatest)    // 最新视频流
 		pub.GET("/:id", h.GetVideoDetail)   // 视频详情
 		pub.POST("/:id/play", h.ReportPlay) // 播放上报:游客也记(user_id=0),所以放公开组
 	}

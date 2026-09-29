@@ -1,6 +1,7 @@
-package video
+package feed
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -13,11 +14,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"feed-system/internal/model/video"
 	"feed-system/internal/pkg/errs"
 )
 
-func newLatestTestRouter(t *testing.T) *gin.Engine {
-	t.Helper()
+type latestFeedRepo struct {
+	items []*video.Video
+}
+
+func (r latestFeedRepo) ListLatestVideos(context.Context, time.Time, int) ([]*video.Video, error) {
+	return r.items, nil
+}
+
+func TestRegisterRouter_ListLatest(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 
 	miniRedis := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: miniRedis.Addr()})
@@ -27,47 +37,34 @@ func newLatestTestRouter(t *testing.T) *gin.Engine {
 		}
 	})
 
-	video := publishedVideo()
-	video.CreatedAt = time.Now().Add(-time.Minute)
-	repo := &fakeVideoRepo{videos: map[int64]*Video{video.ID: video}}
-	svc := NewVideoService(repo, rdb, nil)
+	repo := latestFeedRepo{items: []*video.Video{{
+		ID:        1,
+		CreatedAt: time.Now().Add(-time.Minute),
+		Status:    video.StatusPublished,
+	}}}
+	svc := NewFeedService(repo, rdb, nil)
 	router := gin.New()
-	RegisterRouter(router.Group("/api/v1"), NewVideoHandler(svc), nil, rdb)
-	return router
-}
-
-func TestRegisterRouter_ListLatest(t *testing.T) {
-	gin.SetMode(gin.TestMode)
+	v1 := router.Group("/api/v1")
+	RegisterRouter(v1, NewFeedHandler(svc), nil, rdb)
+	// 同时注册 video 路由,确认原有 /videos/latest 不会被 /videos/:id 抢走。
+	video.RegisterRouter(v1, video.NewVideoHandler(video.NewVideoService(nil, nil, nil)), nil, rdb)
 
 	tests := []struct {
-		name       string
-		query      string
-		wantCode   int
-		wantStatus int
+		name     string
+		query    string
+		wantCode int
 	}{
-		{
-			name:       "公开路由返回最新视频",
-			query:      "?limit=1",
-			wantCode:   0,
-			wantStatus: http.StatusOK,
-		},
-		{
-			name:       "limit 超出范围返回参数错误",
-			query:      "?limit=101",
-			wantCode:   errs.ErrInvalidParam.Code,
-			wantStatus: http.StatusOK,
-		},
+		{name: "公开路由返回最新视频", query: "?limit=1", wantCode: 0},
+		{name: "limit 超出范围返回参数错误", query: "?limit=101", wantCode: errs.ErrInvalidParam.Code},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			router := newLatestTestRouter(t)
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/videos/latest"+tt.query, nil)
 			resp := httptest.NewRecorder()
 			router.ServeHTTP(resp, req)
 
-			assert.Equal(t, tt.wantStatus, resp.Code)
-
+			assert.Equal(t, http.StatusOK, resp.Code)
 			var body struct {
 				Code int             `json:"code"`
 				Data *ListLatestResp `json:"data"`

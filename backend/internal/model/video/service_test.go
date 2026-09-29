@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
-	"sort"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -82,7 +80,6 @@ type fakeVideoRepo struct {
 	saveErr error
 
 	playURLCalls int // FindVideoByPlayURL 被调了几次,用于断言缓存有没有挡住回源
-	listErr      error
 }
 
 func (f *fakeVideoRepo) CreateVideo(ctx context.Context, v *Video) error { return nil }
@@ -105,6 +102,10 @@ func (f *fakeVideoRepo) FindVideoByPlayURL(ctx context.Context, playURL string) 
 	return nil, ErrNotFound
 }
 
+func (f *fakeVideoRepo) ListLikedVideoIDs(ctx context.Context, userID int64, videoIDs []int64) ([]int64, error) {
+	return []int64{}, nil
+}
+
 // SavePlayReport 真实实现里插流水和 play_count 自增在同一个事务,这里也一起做
 func (f *fakeVideoRepo) SavePlayReport(ctx context.Context, r *PlayRecord) error {
 	if f.saveErr != nil {
@@ -123,26 +124,6 @@ func (f *fakeVideoRepo) UpdateVideoFields(ctx context.Context, id int64, fields 
 	}
 	f.lastFields = fields
 	return nil
-}
-
-// ListLatestVideos 内存实现,语义与 GORM 版对齐:只给已发布的、严格早于 before 的,
-// 按时间倒序,最多 limit 条
-func (f *fakeVideoRepo) ListLatestVideos(ctx context.Context, before time.Time, limit int) ([]*Video, error) {
-	if f.listErr != nil {
-		return nil, f.listErr
-	}
-	var out []*Video
-	for _, v := range f.videos {
-		if v.Status == StatusPublished && v.CreatedAt.Before(before) {
-			out = append(out, v)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
-	// 与 GORM 对齐:Limit(0) 是空集,只有负数才是「不加 LIMIT」
-	if limit >= 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
 }
 
 const testUserID int64 = 7

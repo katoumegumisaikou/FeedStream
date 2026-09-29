@@ -61,3 +61,13 @@ type PlayRecord struct {
 	IP        string    `gorm:"type:varchar(45)"         json:"ip"`        // IPv6 最长 45 字符
 	CreatedAt time.Time `gorm:"type:timestamp;not null" json:"created_at"`
 }
+
+// VideoLike 表示用户当前对视频的一次点赞。
+// 取消点赞时删除记录;同一用户对同一视频只能有一条记录,由数据库唯一约束保证。
+// 表结构与索引定义见 migrations/007_create_video_likes.sql。
+type VideoLike struct {
+	ID        int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	UserID    int64     `gorm:"not null"                 json:"user_id"`
+	VideoID   int64     `gorm:"not null"                 json:"video_id"`
+	CreatedAt time.Time `gorm:"type:timestamp;not null" json:"created_at"`
+}
