@@ -26,6 +26,10 @@ func (r latestFeedRepo) ListLatestVideos(context.Context, time.Time, int) ([]*vi
 	return r.items, nil
 }
 
+func (r latestFeedRepo) ListVideosByLikes(context.Context, int64, int64, int) ([]*video.Video, error) {
+	return r.items, nil
+}
+
 func TestRegisterRouter_ListLatest(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

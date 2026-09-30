@@ -38,3 +38,24 @@ type ListLatestResp struct {
 	// NextCursor 下一页游标(Unix 秒);0 表示没有更多
 	NextCursor int64 `json:"next_cursor"`
 }
+
+// ListLikeReq 按点赞数排序的视频流请求。
+// 首页不传游标;翻页时两个游标字段需同时传。
+type ListLikeReq struct {
+	Limit            int    `form:"limit" binding:"omitempty,min=1,max=100"`
+	CursorLikesCount *int64 `form:"cursor_likes_count" binding:"omitempty,min=0"`
+	CursorVideoID    *int64 `form:"cursor_video_id" binding:"omitempty,min=1"`
+}
+
+// LikeCursor 是视频流的下一页游标。
+type LikeCursor struct {
+	LikesCount int64 `json:"likes_count"`
+	VideoID    int64 `json:"video_id"`
+}
+
+// ListLikeResp 按点赞数排序的视频流响应。
+type ListLikeResp struct {
+	Items []FeedItem `json:"items"`
+	// nil 表示没有更多数据。
+	NextCursor *LikeCursor `json:"next_cursor,omitempty"`
+}

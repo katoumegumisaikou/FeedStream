@@ -13,7 +13,7 @@ import (
 	"feed-system/internal/pkg/sfcache"
 )
 
-// FeedService 最新视频流业务层。
+// FeedService Feed 流业务层。
 type FeedService struct {
 	repo  FeedRepository
 	rdb   *redis.Client
@@ -55,6 +55,31 @@ func toFeedItem(v *video.Video) *FeedItem {
 		LikesCount:   v.LikesCount,
 		CommentCount: v.CommentCount,
 	}
+}
+
+func (s *FeedService) setLikeStatuses(ctx context.Context, userID int64, items []FeedItem) error {
+	if userID <= 0 || len(items) == 0 {
+		return nil
+	}
+	if s.likes == nil {
+		slog.ErrorContext(ctx, "视频流点赞状态查询器未配置", "user_id", userID)
+		return errs.ErrInternal
+	}
+
+	videoIDs := make([]int64, 0, len(items))
+	for _, item := range items {
+		videoIDs = append(videoIDs, item.ID)
+	}
+	statuses, err := s.likes.GetUserLikeStatuses(ctx, userID, videoIDs)
+	if err != nil {
+		// 点赞查询由提供方记录底层错误,这里仅返回通用内部错误。
+		return errs.ErrInternal
+	}
+	for i := range items {
+		liked := statuses[items[i].ID]
+		items[i].IsLike = &liked
+	}
+	return nil
 }
 
 func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID int64) (*ListLatestResp, error) {
@@ -178,29 +203,63 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 		}
 	}
 
-	// 点赞状态取决于当前用户,在读完共享缓存后单独补齐,不写回 Redis。
-	if userID > 0 && len(resp.Items) > 0 {
-		if s.likes == nil {
-			slog.ErrorContext(ctx, "视频流点赞状态查询器未配置", "user_id", userID)
-			return nil, errs.ErrInternal
-		}
-		videoIDs := make([]int64, 0, len(resp.Items))
-		for _, item := range resp.Items {
-			videoIDs = append(videoIDs, item.ID)
-		}
-		statuses, err := s.likes.GetUserLikeStatuses(ctx, userID, videoIDs)
-		if err != nil {
-			// 点赞查询由提供方记录底层错误,这里仅向上返回通用内部错误,不暴露实现细节。
-			return nil, errs.ErrInternal
-		}
-		for i := range resp.Items {
-			liked := statuses[resp.Items[i].ID]
-			resp.Items[i].IsLike = &liked
-		}
+	// 点赞状态只加在响应副本上,不写入共享 Redis 缓存。
+	if err := s.setLikeStatuses(ctx, userID, resp.Items); err != nil {
+		return nil, err
 	}
 
 	if n := len(resp.Items); n > 0 {
 		resp.NextCursor = resp.Items[n-1].CreatedAt.Unix()
+	}
+	return &resp, nil
+}
+
+func (s *FeedService) ListLike(ctx context.Context, req ListLikeReq, userID int64) (*ListLikeResp, error) {
+	limit := req.Limit
+	if limit == 0 {
+		limit = defaultLatestLimit
+	}
+	if limit < 1 || limit > defaultLatestLimit {
+		return nil, errs.ErrInvalidParam.WithMsg("每页数量无效")
+	}
+
+	var cursorLikesCount, cursorVideoID int64
+	switch {
+	case req.CursorLikesCount == nil && req.CursorVideoID == nil:
+		// 首页不带游标。
+	case req.CursorLikesCount == nil || req.CursorVideoID == nil:
+		return nil, errs.ErrInvalidParam.WithMsg("分页游标无效")
+	default:
+		cursorLikesCount = *req.CursorLikesCount
+		cursorVideoID = *req.CursorVideoID
+		if cursorLikesCount < 0 || cursorVideoID <= 0 {
+			return nil, errs.ErrInvalidParam.WithMsg("分页游标无效")
+		}
+	}
+
+	videos, err := s.repo.ListVideosByLikes(ctx, cursorLikesCount, cursorVideoID, limit+1)
+	if err != nil {
+		slog.ErrorContext(ctx, "按点赞数查询视频流失败", "cursor_likes_count", cursorLikesCount, "cursor_video_id", cursorVideoID, "err", err)
+		return nil, errs.ErrInternal
+	}
+
+	hasMore := len(videos) > limit
+	if hasMore {
+		videos = videos[:limit]
+	}
+
+	resp := ListLikeResp{Items: make([]FeedItem, 0, len(videos))}
+	for _, item := range videos {
+		if card := toFeedItem(item); card != nil {
+			resp.Items = append(resp.Items, *card)
+		}
+	}
+	if hasMore && len(resp.Items) > 0 {
+		last := resp.Items[len(resp.Items)-1]
+		resp.NextCursor = &LikeCursor{LikesCount: last.LikesCount, VideoID: last.ID}
+	}
+	if err := s.setLikeStatuses(ctx, userID, resp.Items); err != nil {
+		return nil, err
 	}
 	return &resp, nil
 }
