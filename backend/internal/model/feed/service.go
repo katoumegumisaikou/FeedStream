@@ -91,6 +91,10 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 	if limit == 0 {
 		limit = defaultLatestLimit
 	}
+	// 多要一条:能取到就说明后面还有,这时才给 cursor。
+	// 和 ListLike 同一套判据 —— next_cursor 的「有没有」立刻是准的,
+	// 前端不用为了确认到底而多请求一次空页
+	want := limit + 1
 
 	// 取缓存里最旧的一条,只为判断 ZSET 空不空
 	oldest, err := s.rdb.ZRangeWithScores(ctx, latestVideosKey, 0, 0).Result()
@@ -172,7 +176,7 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 
 	// 游标早于缓存覆盖范围时直接查数据库。
 	if len(result) == 0 || !cursor.After(oldestCachedAt) {
-		videos, err := s.repo.ListLatestVideos(ctx, cursor, limit)
+		videos, err := s.repo.ListLatestVideos(ctx, cursor, want)
 		if err != nil {
 			slog.ErrorContext(ctx, "查询最新流失败", "cursor", cursor, "err", err)
 			return nil, errs.ErrInternal.WithMsg("查询最新流失败")
@@ -182,7 +186,7 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 		}
 	} else {
 		for _, item := range result {
-			if len(resp.Items) >= limit {
+			if len(resp.Items) >= want {
 				break
 			}
 			if item.CreatedAt.Before(cursor) {
@@ -191,8 +195,8 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 		}
 
 		// 热数据不足一页时,从缓存边界之前查冷数据补足。
-		if len(resp.Items) < limit {
-			remaining := limit - len(resp.Items)
+		if len(resp.Items) < want {
+			remaining := want - len(resp.Items)
 			videos, err := s.repo.ListLatestVideos(ctx, oldestCachedAt, remaining)
 			if err != nil {
 				return nil, errs.ErrInternal.WithMsg("查询最新流失败")
@@ -203,13 +207,20 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 		}
 	}
 
+	// 多要的那条只用来判「还有没有更多」,不进响应
+	hasMore := len(resp.Items) > limit
+	if hasMore {
+		resp.Items = resp.Items[:limit]
+	}
+
 	// 点赞状态只加在响应副本上,不写入共享 Redis 缓存。
 	if err := s.setLikeStatuses(ctx, userID, resp.Items); err != nil {
 		return nil, err
 	}
 
-	if n := len(resp.Items); n > 0 {
-		resp.NextCursor = resp.Items[n-1].CreatedAt.Unix()
+	// 只在确实还有下一页时给 cursor;到底了就留 0(见 ListLatestResp 注释)
+	if hasMore && len(resp.Items) > 0 {
+		resp.NextCursor = resp.Items[len(resp.Items)-1].CreatedAt.Unix()
 	}
 	return &resp, nil
 }

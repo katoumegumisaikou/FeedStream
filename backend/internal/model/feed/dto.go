@@ -35,7 +35,8 @@ type FeedItem struct {
 type ListLatestResp struct {
 	// Items service 保证非 nil,空页也返回 [] 而不是 null。
 	Items []FeedItem `json:"items"`
-	// NextCursor 下一页游标(Unix 秒);0 表示没有更多
+	// NextCursor 下一页游标(Unix 秒)。只在确实还有下一页时才给,到底了留 0 ——
+	// 前端可以直接拿它决定「加载更多」显不显示,不用再多请求一次空页来确认
 	NextCursor int64 `json:"next_cursor"`
 }
 
