@@ -14,22 +14,29 @@ import (
 	"feed-system/internal/model/video"
 )
 
-// pagedFeedRepo 遵守 before 和 limit 的内存仓储。
+// pagedFeedRepo 遵守 (before, beforeID) 和 limit 的内存仓储。
 //
-// handler_test 里那个 latestFeedRepo 把这两个参数都忽略了,所以只能验「返回了什么」,
-// 验不了分页 —— hasMore 这件事必须让仓储真的按 limit 截断才测得出来
+// handler_test 里那个 latestFeedRepo 把这几个参数全忽略了,所以只能验「返回了什么」,
+// 验不了分页 —— hasMore 和复合游标都必须让仓储真的按参数筛选/截断才测得出来
 type pagedFeedRepo struct {
 	videos []*video.Video
 }
 
-func (r *pagedFeedRepo) ListLatestVideos(_ context.Context, before time.Time, limit int) ([]*video.Video, error) {
+func (r *pagedFeedRepo) ListLatestVideos(_ context.Context, before time.Time, beforeID int64, limit int) ([]*video.Video, error) {
 	var out []*video.Video
 	for _, v := range r.videos {
-		if v.CreatedAt.Before(before) {
-			out = append(out, v)
+		// beforeID 为 0 表示首页,不设边界 —— 和 SQL 里那条 if 对应
+		if beforeID > 0 && !older(v.CreatedAt, v.ID, before, beforeID) {
+			continue
 		}
+		out = append(out, v)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].CreatedAt.After(out[j].CreatedAt)
+		}
+		return out[i].ID > out[j].ID
+	})
 	if limit >= 0 && len(out) > limit {
 		out = out[:limit]
 	}
@@ -54,10 +61,17 @@ func publishedAt(id int64, at time.Time) *video.Video {
 	return &video.Video{ID: id, Title: "v", CreatedAt: at, Status: video.StatusPublished}
 }
 
+// pageWith 把上一页返回的游标塞回请求,模拟前端翻页
+func pageWith(req ListLatestReq, c *FeedCursor) ListLatestReq {
+	req.CursorCreatedAt = &c.CreatedAt
+	req.CursorVideoID = &c.VideoID
+	return req
+}
+
 // TestListLatest_NextCursor 锁住「next_cursor 只在确实还有下一页时才给」。
 //
-// 改之前是「这页只要有数据就给」,于是最后一页也会带一个非 0 的游标,
-// 前端得再请求一次空页才知道到底了。现在和 ListLike 一样多要一条来判 hasMore
+// 改之前是「这页只要有数据就给」,于是最后一页也会带一个游标,
+// 前端得再请求一次空页才知道到底了
 func TestListLatest_NextCursor(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -74,13 +88,13 @@ func TestListLatest_NextCursor(t *testing.T) {
 		require.Len(t, page1.Items, 2, "limit=2 就只给 2 条,多要的那条不进响应")
 		assert.Equal(t, int64(3), page1.Items[0].ID)
 		assert.Equal(t, int64(2), page1.Items[1].ID)
-		require.NotZero(t, page1.NextCursor, "后面还剩一条,该给游标")
+		require.NotNil(t, page1.NextCursor, "后面还剩一条,该给游标")
 
-		page2, err := svc.ListLatest(ctx, ListLatestReq{Limit: 2, Cursor: page1.NextCursor}, 0)
+		page2, err := svc.ListLatest(ctx, pageWith(ListLatestReq{Limit: 2}, page1.NextCursor), 0)
 		require.NoError(t, err)
 		require.Len(t, page2.Items, 1)
 		assert.Equal(t, int64(1), page2.Items[0].ID)
-		assert.Equal(t, int64(0), page2.NextCursor, "取完了,游标该是 0")
+		assert.Nil(t, page2.NextCursor, "取完了,游标该是 nil")
 	})
 
 	t.Run("正好取满时不留游标", func(t *testing.T) {
@@ -92,15 +106,51 @@ func TestListLatest_NextCursor(t *testing.T) {
 		resp, err := svc.ListLatest(ctx, ListLatestReq{Limit: 2}, 0)
 		require.NoError(t, err)
 		require.Len(t, resp.Items, 2)
-		assert.Equal(t, int64(0), resp.NextCursor,
+		assert.Nil(t, resp.NextCursor,
 			"正好取满且后面没有了 —— 不该给个假游标让前端白跑一趟")
 	})
 
-	t.Run("没有视频时游标为 0", func(t *testing.T) {
+	t.Run("没有视频时没有游标", func(t *testing.T) {
 		resp, err := newLatestService(t, nil).ListLatest(ctx, ListLatestReq{Limit: 2}, 0)
 		require.NoError(t, err)
 		assert.NotNil(t, resp.Items)
 		assert.Empty(t, resp.Items)
-		assert.Equal(t, int64(0), resp.NextCursor)
+		assert.Nil(t, resp.NextCursor)
+	})
+
+	// 这条是复合游标存在的理由。三条视频同一时刻发布,只带时间戳的旧游标
+	// 在第二页会问「created_at < 那个时刻」→ 一条都不满足 → 第三条被整个丢掉
+	t.Run("同一时刻发布的多条不会跨页漏掉", func(t *testing.T) {
+		at := now.Add(-time.Minute)
+		svc := newLatestService(t, []*video.Video{
+			publishedAt(3, at),
+			publishedAt(2, at),
+			publishedAt(1, at),
+		})
+
+		page1, err := svc.ListLatest(ctx, ListLatestReq{Limit: 2}, 0)
+		require.NoError(t, err)
+		require.Len(t, page1.Items, 2)
+		assert.Equal(t, int64(3), page1.Items[0].ID, "同一时刻按 id 倒序")
+		assert.Equal(t, int64(2), page1.Items[1].ID)
+		require.NotNil(t, page1.NextCursor)
+
+		page2, err := svc.ListLatest(ctx, pageWith(ListLatestReq{Limit: 2}, page1.NextCursor), 0)
+		require.NoError(t, err)
+		require.Len(t, page2.Items, 1, "第三条不能因为和前两条同一时刻就被丢掉")
+		assert.Equal(t, int64(1), page2.Items[0].ID)
+		assert.Nil(t, page2.NextCursor)
+	})
+
+	t.Run("只传一半的游标被判为参数无效", func(t *testing.T) {
+		at := now.Add(-time.Minute).UnixMicro()
+		svc := newLatestService(t, nil)
+
+		_, err := svc.ListLatest(ctx, ListLatestReq{Limit: 2, CursorCreatedAt: &at}, 0)
+		assert.Error(t, err, "只给 created_at 不给 id 的话边界不完整")
+
+		id := int64(7)
+		_, err = svc.ListLatest(ctx, ListLatestReq{Limit: 2, CursorVideoID: &id}, 0)
+		assert.Error(t, err)
 	})
 }

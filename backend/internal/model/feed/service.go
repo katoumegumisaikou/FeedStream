@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -107,7 +108,8 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 		// sfcache 这里只用于并发去重,缓存本身由下面的 ZSET 保存。
 		videos, err := sfcache.Load(ctx, nil, latestVideosKey, time.Minute,
 			func(loadCtx context.Context) ([]*video.Video, error) {
-				videos, err := s.repo.ListLatestVideos(loadCtx, time.Now(), latestBackfillSize)
+				// beforeID 传 0:回填要的是「最新一批」,不设上界
+				videos, err := s.repo.ListLatestVideos(loadCtx, time.Now(), 0, latestBackfillSize)
 				if err != nil {
 					return nil, errs.ErrInternal
 				}
@@ -159,26 +161,66 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 		}
 	}
 
-	// 首页(0)使用当前秒级时间戳。
-	cursorSeconds := req.Cursor
-	if cursorSeconds == 0 {
-		cursorSeconds = time.Now().Unix()
+	// ZSET 的 score 只到秒,同一秒的成员 Redis 按 member 字典序排 —— 那个顺序和
+	// (created_at, id) 无关。缓存里成员不多(≤ latestBackfillSize),统一再排一次,
+	// 让内存里的顺序和 SQL 的 ORDER BY created_at DESC, id DESC 完全一致;
+	// 否则同一时刻的几条会在翻页时重复出现
+	sort.SliceStable(result, func(i, j int) bool {
+		a, b := result[i], result[j]
+		if a == nil {
+			return false
+		}
+		if b == nil {
+			return true
+		}
+		if am, bm := a.CreatedAt.UnixMicro(), b.CreatedAt.UnixMicro(); am != bm {
+			return am > bm
+		}
+		return a.ID > b.ID
+	})
+
+	// 游标是 (created_at, id) 复合的:两个字段要么都传要么都不传,
+	// 只传一个的话边界不完整,那还不如当首页处理
+	var (
+		hasCursor bool
+		cursorAt  time.Time
+		cursorID  int64
+	)
+	switch {
+	case req.CursorCreatedAt == nil && req.CursorVideoID == nil:
+		// 首页,不设边界
+	case req.CursorCreatedAt == nil || req.CursorVideoID == nil:
+		return nil, errs.ErrInvalidParam.WithMsg("分页游标无效")
+	default:
+		if *req.CursorVideoID <= 0 {
+			return nil, errs.ErrInvalidParam.WithMsg("分页游标无效")
+		}
+		hasCursor = true
+		cursorAt = time.UnixMicro(*req.CursorCreatedAt)
+		cursorID = *req.CursorVideoID
 	}
-	cursor := time.Unix(cursorSeconds, 0)
 
 	resp := ListLatestResp{Items: []FeedItem{}}
-	var oldestCachedAt time.Time
+
+	// 缓存里最旧的那条(按 created_at DESC, id DESC 排最后),用来判断缓存覆盖到哪
+	var (
+		oldestAt time.Time
+		oldestID int64
+	)
 	for _, item := range result {
-		if item != nil && (oldestCachedAt.IsZero() || item.CreatedAt.Before(oldestCachedAt)) {
-			oldestCachedAt = item.CreatedAt
+		if item == nil {
+			continue
+		}
+		if oldestID == 0 || older(item.CreatedAt, item.ID, oldestAt, oldestID) {
+			oldestAt, oldestID = item.CreatedAt, item.ID
 		}
 	}
 
-	// 游标早于缓存覆盖范围时直接查数据库。
-	if len(result) == 0 || !cursor.After(oldestCachedAt) {
-		videos, err := s.repo.ListLatestVideos(ctx, cursor, want)
+	// 游标落在缓存覆盖范围之外(比缓存最旧的还旧)时,直接查数据库
+	if len(result) == 0 || (hasCursor && older(cursorAt, cursorID, oldestAt, oldestID)) {
+		videos, err := s.repo.ListLatestVideos(ctx, cursorAt, cursorID, want)
 		if err != nil {
-			slog.ErrorContext(ctx, "查询最新流失败", "cursor", cursor, "err", err)
+			slog.ErrorContext(ctx, "查询最新流失败", "cursor_at", cursorAt, "cursor_id", cursorID, "err", err)
 			return nil, errs.ErrInternal.WithMsg("查询最新流失败")
 		}
 		for _, item := range videos {
@@ -189,15 +231,15 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 			if len(resp.Items) >= want {
 				break
 			}
-			if item.CreatedAt.Before(cursor) {
+			if !hasCursor || older(item.CreatedAt, item.ID, cursorAt, cursorID) {
 				resp.Items = append(resp.Items, *item)
 			}
 		}
 
-		// 热数据不足一页时,从缓存边界之前查冷数据补足。
+		// 热数据不足一页时,从缓存边界之前查冷数据补足
 		if len(resp.Items) < want {
 			remaining := want - len(resp.Items)
-			videos, err := s.repo.ListLatestVideos(ctx, oldestCachedAt, remaining)
+			videos, err := s.repo.ListLatestVideos(ctx, oldestAt, oldestID, remaining)
 			if err != nil {
 				return nil, errs.ErrInternal.WithMsg("查询最新流失败")
 			}
@@ -218,11 +260,26 @@ func (s *FeedService) ListLatest(ctx context.Context, req ListLatestReq, userID 
 		return nil, err
 	}
 
-	// 只在确实还有下一页时给 cursor;到底了就留 0(见 ListLatestResp 注释)
+	// 只在确实还有下一页时给游标;到底了就是 nil(见 ListLatestResp 注释)
 	if hasMore && len(resp.Items) > 0 {
-		resp.NextCursor = resp.Items[len(resp.Items)-1].CreatedAt.Unix()
+		last := resp.Items[len(resp.Items)-1]
+		resp.NextCursor = &FeedCursor{CreatedAt: last.CreatedAt.UnixMicro(), VideoID: last.ID}
 	}
 	return &resp, nil
+}
+
+// older 判断 (at, id) 是否严格排在 (thanAt, thanID) 之后,也就是更旧的那一侧。
+// 与 SQL 的 (created_at, id) < (?, ?) 同一语义:先比时间,时间相同再比 id。
+//
+// 时间只比到微秒 —— created_at 列是 TIMESTAMP(微秒),游标也按微秒传。
+// 直接比 time.Time 的话,值里残留的纳秒会让本该相等的一对判成不等,
+// 那些视频会被当成「不是更旧」而静默跳过,翻页整批漏掉
+func older(at time.Time, id int64, thanAt time.Time, thanID int64) bool {
+	am, bm := at.UnixMicro(), thanAt.UnixMicro()
+	if am != bm {
+		return am < bm
+	}
+	return id < thanID
 }
 
 func (s *FeedService) ListLike(ctx context.Context, req ListLikeReq, userID int64) (*ListLikeResp, error) {

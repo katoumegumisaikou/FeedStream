@@ -22,7 +22,7 @@ type latestFeedRepo struct {
 	items []*video.Video
 }
 
-func (r latestFeedRepo) ListLatestVideos(context.Context, time.Time, int) ([]*video.Video, error) {
+func (r latestFeedRepo) ListLatestVideos(context.Context, time.Time, int64, int) ([]*video.Video, error) {
 	return r.items, nil
 }
 
