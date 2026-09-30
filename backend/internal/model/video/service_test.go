@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
+	"sort"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
@@ -76,10 +78,11 @@ type fakeVideoRepo struct {
 	lastFields map[string]any // 记下最后一次写了哪些列
 	updateErr  error
 
-	records []*PlayRecord // 记下写进来的播放流水
+	records []*PlayRecord // 记下写进来的播放流水,同时当观看历史的查询源
 	saveErr error
 
-	playURLCalls int // FindVideoByPlayURL 被调了几次,用于断言缓存有没有挡住回源
+	playURLCalls   int // FindVideoByPlayURL 被调了几次,用于断言缓存有没有挡住回源
+	listHistoryErr error
 }
 
 func (f *fakeVideoRepo) CreateVideo(ctx context.Context, v *Video) error { return nil }
@@ -104,6 +107,73 @@ func (f *fakeVideoRepo) FindVideoByPlayURL(ctx context.Context, playURL string) 
 
 func (f *fakeVideoRepo) ListLikedVideoIDs(ctx context.Context, userID int64, videoIDs []int64) ([]int64, error) {
 	return []int64{}, nil
+}
+
+// FindVideosByIDs 顺序不保证,和真实实现一致 —— 调用方必须自己按原顺序拼
+func (f *fakeVideoRepo) FindVideosByIDs(ctx context.Context, ids []int64) ([]*Video, error) {
+	var out []*Video
+	for _, id := range ids {
+		if v, ok := f.videos[id]; ok {
+			out = append(out, v)
+		}
+	}
+	return out, nil
+}
+
+// olderPlay 与 SQL 的 (created_at, video_id) < (?, ?) 同一语义:先比时间,
+// 时间相同再比 id。时间比到微秒 —— 和列精度对齐
+func olderPlay(at time.Time, videoID int64, thanAt time.Time, thanVideoID int64) bool {
+	am, bm := at.UnixMicro(), thanAt.UnixMicro()
+	if am != bm {
+		return am < bm
+	}
+	return videoID < thanVideoID
+}
+
+// ListPlayHistory 内存实现,语义与 SQL 版对齐:先按 video_id 收敛成最近一条,
+// 再按游标过滤、排序、截断。只返回已发布的视频(真实实现是在 JOIN 时过滤的)
+func (f *fakeVideoRepo) ListPlayHistory(_ context.Context, userID int64, before time.Time, beforeVideoID int64, limit int) ([]*PlayHistoryEntry, error) {
+	if f.listHistoryErr != nil {
+		return nil, f.listHistoryErr
+	}
+
+	latest := map[int64]*PlayRecord{}
+	for _, r := range f.records {
+		if r.UserID != userID {
+			continue
+		}
+		if cur, ok := latest[r.VideoID]; !ok || r.CreatedAt.After(cur.CreatedAt) {
+			latest[r.VideoID] = r
+		}
+	}
+
+	var out []*PlayHistoryEntry
+	for _, r := range latest {
+		// 收敛之后才按游标过滤 —— 顺序反了会把同一视频的旧记录留到下一页
+		if beforeVideoID > 0 && !olderPlay(r.CreatedAt, r.VideoID, before, beforeVideoID) {
+			continue
+		}
+		if v, ok := f.videos[r.VideoID]; !ok || v.Status != StatusPublished {
+			continue
+		}
+		out = append(out, &PlayHistoryEntry{
+			VideoID:   r.VideoID,
+			Watched:   r.Watched,
+			Duration:  r.Duration,
+			WatchedAt: r.CreatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		am, bm := out[i].WatchedAt.UnixMicro(), out[j].WatchedAt.UnixMicro()
+		if am != bm {
+			return am > bm
+		}
+		return out[i].VideoID > out[j].VideoID
+	})
+	if limit >= 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
 }
 
 // SavePlayReport 真实实现里插流水和 play_count 自增在同一个事务,这里也一起做
@@ -435,6 +505,208 @@ func TestReportPlay(t *testing.T) {
 		repo.saveErr = errors.New("boom")
 
 		err := svc.ReportPlay(ctx, 1, 0, PlayReportReq{Watched: 1, Duration: 2}, ip)
+		assertCode(t, err, errs.ErrInternal)
+	})
+}
+
+// TestListHistory 观看历史。重点在两处:
+//   - 同一个视频看多次只出一条(play_records 是流水表,直接吐会重复)
+//   - 只拿得到自己的记录(user_id 是过滤条件,不是装饰)
+func TestListHistory(t *testing.T) {
+	ctx := context.Background()
+	base := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+
+	pub := func(id int64, at time.Time) *Video {
+		v := draftVideo()
+		v.ID = id
+		v.Status = StatusPublished
+		v.CreatedAt = at
+		return v
+	}
+	rec := func(videoID, watched int, at time.Time) *PlayRecord {
+		return &PlayRecord{
+			UserID: testUserID, VideoID: int64(videoID),
+			Watched: watched, Duration: 120, CreatedAt: at,
+		}
+	}
+	// historyRepo 直接塞 records,不走上报接口 —— 这样才能精确控制 created_at
+	historyRepo := func(videos []*Video, records []*PlayRecord) *fakeVideoRepo {
+		repo := &fakeVideoRepo{videos: map[int64]*Video{}}
+		for _, v := range videos {
+			repo.videos[v.ID] = v
+		}
+		repo.records = records
+		return repo
+	}
+	svcOf := func(repo *fakeVideoRepo) *VideoService { return NewVideoService(repo, nil, nil) }
+	// historyPage 把上一页返回的游标塞回请求,模拟前端翻页
+	historyPage := func(req ListHistoryReq, c *HistoryCursor) ListHistoryReq {
+		req.CursorWatchedAt = &c.WatchedAt
+		req.CursorVideoID = &c.VideoID
+		return req
+	}
+
+	t.Run("游客 401", func(t *testing.T) {
+		_, err := svcOf(historyRepo(nil, nil)).ListHistory(ctx, 0, ListHistoryReq{})
+		assertCode(t, err, errs.ErrUnauthorized)
+	})
+
+	t.Run("没有记录时返回空列表而不是 nil", func(t *testing.T) {
+		resp, err := svcOf(historyRepo(nil, nil)).ListHistory(ctx, testUserID, ListHistoryReq{})
+		require.NoError(t, err)
+		assert.NotNil(t, resp.Items, "空页也要是 [],前端才不用判空")
+		assert.Empty(t, resp.Items)
+		assert.Nil(t, resp.NextCursor)
+	})
+
+	t.Run("按最近观看时间倒序", func(t *testing.T) {
+		repo := historyRepo(
+			[]*Video{pub(1, base), pub(2, base)},
+			[]*PlayRecord{
+				rec(1, 30, base.Add(-2*time.Hour)),
+				rec(2, 90, base.Add(-1*time.Hour)),
+			},
+		)
+
+		resp, err := svcOf(repo).ListHistory(ctx, testUserID, ListHistoryReq{})
+		require.NoError(t, err)
+		require.Len(t, resp.Items, 2)
+		assert.Equal(t, int64(2), resp.Items[0].ID, "最近看的排前面")
+		assert.Equal(t, 90, resp.Items[0].Watched)
+		assert.Equal(t, base.Add(-1*time.Hour), resp.Items[0].WatchedAt)
+		assert.Equal(t, int64(1), resp.Items[1].ID)
+	})
+
+	t.Run("同一个视频看多次只出一条,取最近那次", func(t *testing.T) {
+		repo := historyRepo(
+			[]*Video{pub(1, base)},
+			[]*PlayRecord{
+				rec(1, 10, base.Add(-3*time.Hour)),
+				rec(1, 80, base.Add(-1*time.Hour)), // 最近
+				rec(1, 50, base.Add(-2*time.Hour)),
+			},
+		)
+
+		resp, err := svcOf(repo).ListHistory(ctx, testUserID, ListHistoryReq{})
+		require.NoError(t, err)
+		require.Len(t, resp.Items, 1, "同一个视频只该出现一条")
+		assert.Equal(t, 80, resp.Items[0].Watched, "进度取最近那次")
+		assert.Equal(t, base.Add(-1*time.Hour), resp.Items[0].WatchedAt)
+	})
+
+	t.Run("只看得到自己的记录", func(t *testing.T) {
+		mine := rec(1, 60, base.Add(-2*time.Hour))
+		others := rec(1, 30, base.Add(-time.Hour)) // 更新,但属于别人
+		others.UserID = 999
+
+		repo := historyRepo([]*Video{pub(1, base)}, []*PlayRecord{others, mine})
+
+		resp, err := svcOf(repo).ListHistory(ctx, testUserID, ListHistoryReq{})
+		require.NoError(t, err)
+		require.Len(t, resp.Items, 1)
+		assert.Equal(t, 60, resp.Items[0].Watched, "不该被别人的记录顶掉")
+	})
+
+	t.Run("未发布的视频不出现", func(t *testing.T) {
+		draft := pub(2, base)
+		draft.Status = StatusDraft
+
+		repo := historyRepo(
+			[]*Video{pub(1, base), draft},
+			[]*PlayRecord{
+				rec(1, 30, base.Add(-time.Hour)),
+				rec(2, 30, base.Add(-time.Hour)),
+			},
+		)
+
+		resp, err := svcOf(repo).ListHistory(ctx, testUserID, ListHistoryReq{})
+		require.NoError(t, err)
+		require.Len(t, resp.Items, 1)
+		assert.Equal(t, int64(1), resp.Items[0].ID)
+	})
+
+	t.Run("分页:cursor 接着上一页", func(t *testing.T) {
+		repo := historyRepo(
+			[]*Video{pub(1, base), pub(2, base), pub(3, base)},
+			[]*PlayRecord{
+				rec(1, 30, base.Add(-3*time.Hour)),
+				rec(2, 30, base.Add(-2*time.Hour)),
+				rec(3, 30, base.Add(-1*time.Hour)),
+			},
+		)
+		svc := svcOf(repo)
+
+		page1, err := svc.ListHistory(ctx, testUserID, ListHistoryReq{Limit: 2})
+		require.NoError(t, err)
+		require.Len(t, page1.Items, 2)
+		assert.Equal(t, int64(3), page1.Items[0].ID)
+		assert.Equal(t, int64(2), page1.Items[1].ID)
+		require.NotNil(t, page1.NextCursor)
+
+		page2, err := svc.ListHistory(ctx, testUserID, historyPage(ListHistoryReq{Limit: 2}, page1.NextCursor))
+		require.NoError(t, err)
+		require.Len(t, page2.Items, 1)
+		assert.Equal(t, int64(1), page2.Items[0].ID)
+		assert.Nil(t, page2.NextCursor, "取完了,游标该是 nil")
+	})
+
+	// 同一时刻的两条靠 video_id 兜底。只带时间戳的旧游标在第二页会问
+	// 「watched_at < 那个时刻」→ 一条都不满足 → 另一条被整个丢掉
+	t.Run("同一时刻观看的两条不会跨页漏掉", func(t *testing.T) {
+		repo := historyRepo(
+			[]*Video{pub(1, base), pub(2, base)},
+			[]*PlayRecord{
+				rec(1, 30, base.Add(-time.Hour)),
+				rec(2, 30, base.Add(-time.Hour)),
+			},
+		)
+		svc := svcOf(repo)
+
+		page1, err := svc.ListHistory(ctx, testUserID, ListHistoryReq{Limit: 1})
+		require.NoError(t, err)
+		require.Len(t, page1.Items, 1)
+		assert.Equal(t, int64(2), page1.Items[0].ID, "同一时刻按 video_id 倒序")
+		require.NotNil(t, page1.NextCursor)
+
+		page2, err := svc.ListHistory(ctx, testUserID, historyPage(ListHistoryReq{Limit: 1}, page1.NextCursor))
+		require.NoError(t, err)
+		require.Len(t, page2.Items, 1, "另一条不能因为和第一条同一时刻就被丢掉")
+		assert.Equal(t, int64(1), page2.Items[0].ID)
+	})
+
+	// 这条锁的是「先去重、再按 cursor 过滤」这个顺序。
+	// 反过来的话,视频 1 那条更旧的记录(-2.5h)会通过第二页的过滤条件,
+	// 于是视频 1 在翻页后又冒出来一次 —— 而它早在第一页出现过了
+	t.Run("分页不重复:同一视频不会跨页再出现", func(t *testing.T) {
+		repo := historyRepo(
+			[]*Video{pub(1, base), pub(2, base)},
+			[]*PlayRecord{
+				rec(1, 10, base.Add(-150*time.Minute)), // -2.5h,比视频2更新
+				rec(1, 80, base.Add(-time.Hour)),       // 视频1的最近一次
+				rec(2, 30, base.Add(-3*time.Hour)),
+			},
+		)
+		svc := svcOf(repo)
+
+		page1, err := svc.ListHistory(ctx, testUserID, ListHistoryReq{Limit: 1})
+		require.NoError(t, err)
+		require.Len(t, page1.Items, 1)
+		assert.Equal(t, int64(1), page1.Items[0].ID)
+		require.NotNil(t, page1.NextCursor)
+
+		page2, err := svc.ListHistory(ctx, testUserID, historyPage(ListHistoryReq{Limit: 1}, page1.NextCursor))
+		require.NoError(t, err)
+		require.Len(t, page2.Items, 1)
+		assert.Equal(t, int64(2), page2.Items[0].ID,
+			"第二页该是视频2 —— 视频1已经出现过了,它的旧记录不能再冒出来")
+		assert.Nil(t, page2.NextCursor)
+	})
+
+	t.Run("仓储出错返回 500", func(t *testing.T) {
+		repo := historyRepo(nil, nil)
+		repo.listHistoryErr = errors.New("boom")
+
+		_, err := svcOf(repo).ListHistory(ctx, testUserID, ListHistoryReq{})
 		assertCode(t, err, errs.ErrInternal)
 	})
 }

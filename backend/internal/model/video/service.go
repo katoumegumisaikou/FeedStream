@@ -769,6 +769,115 @@ func (s *VideoService) ReportPlay(ctx context.Context, videoID, requesterID int6
 	return nil
 }
 
+// defaultHistoryLimit 观看历史不传 limit 时的默认页大小
+const defaultHistoryLimit = 20
+
+// ListHistory 取某用户的观看历史(GET /videos/history)。
+//
+// requesterID 必须 > 0 —— 路由上挂了 SetSensitive,游客根本到不了这;这里再判一次
+// 是因为 user_id = 0 是「所有未登录访客」共用的一个桶,一旦放行,
+// 查出来的是所有人的记录混在一起,不是「我的历史」
+func (s *VideoService) ListHistory(ctx context.Context, requesterID int64, req ListHistoryReq) (*ListHistoryResp, error) {
+	if requesterID <= 0 {
+		return nil, errs.ErrUnauthorized.WithMsg("用户未登录")
+	}
+
+	limit := req.Limit
+	if limit == 0 {
+		limit = defaultHistoryLimit
+	}
+	// 多要一条:能取到就说明后面还有,这时才给游标(和最新流同一套判据)
+	want := limit + 1
+
+	// 游标是 (watched_at, video_id) 复合的:两个字段要么都传要么都不传,
+	// 只传一个的话边界不完整,还不如当首页处理。
+	// beforeVideoID 留 0 表示首页,由仓储把边界推到无穷远
+	var (
+		before        time.Time
+		beforeVideoID int64
+	)
+	switch {
+	case req.CursorWatchedAt == nil && req.CursorVideoID == nil:
+		// 首页,不设边界
+	case req.CursorWatchedAt == nil || req.CursorVideoID == nil:
+		return nil, errs.ErrInvalidParam.WithMsg("分页游标无效")
+	default:
+		if *req.CursorVideoID <= 0 {
+			return nil, errs.ErrInvalidParam.WithMsg("分页游标无效")
+		}
+		before = time.UnixMicro(*req.CursorWatchedAt)
+		beforeVideoID = *req.CursorVideoID
+	}
+
+	entries, err := s.videorepo.ListPlayHistory(ctx, requesterID, before, beforeVideoID, want)
+	if err != nil {
+		slog.ErrorContext(ctx, "查询观看历史失败", "user_id", requesterID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("查询观看历史失败")
+	}
+
+	resp := &ListHistoryResp{Items: []HistoryItem{}} // 空页也要是 [],前端才不用判空
+	if len(entries) == 0 {
+		return resp, nil
+	}
+
+	// 多要的那条只用来判「还有没有更多」,在这里先截掉。
+	// 用 entries 的长度判而不是拼装后的 —— 视频可能在这两次查询之间被删掉,
+	// 少拼了几条就会把「还有下一页」误判成到底
+	hasMore := len(entries) > limit
+	if hasMore {
+		entries = entries[:limit]
+	}
+
+	ids := make([]int64, 0, len(entries))
+	for _, e := range entries {
+		ids = append(ids, e.VideoID)
+	}
+	videos, err := s.videorepo.FindVideosByIDs(ctx, ids)
+	if err != nil {
+		slog.ErrorContext(ctx, "查询观看历史里的视频失败", "user_id", requesterID, "err", err)
+		return nil, errs.ErrInternal.WithMsg("查询观看历史失败")
+	}
+	byID := make(map[int64]*Video, len(videos))
+	for _, v := range videos {
+		byID[v.ID] = v
+	}
+
+	// 按 entries 的顺序拼,不是 byID 的顺序 —— IN 查询不保证返回顺序
+	for _, e := range entries {
+		v, ok := byID[e.VideoID]
+		if !ok {
+			// 两次查询之间视频被软删或改了状态,跳过这条
+			continue
+		}
+		resp.Items = append(resp.Items, HistoryItem{
+			VideoResp: *toVideoResp(v),
+			Watched:   e.Watched,
+			Duration:  e.Duration,
+			WatchedAt: e.WatchedAt,
+		})
+	}
+	if len(resp.Items) == 0 {
+		return resp, nil
+	}
+
+	// 补点赞态,和最新流一致 —— 历史页上也要能直接点赞
+	statuses, err := s.GetUserLikeStatuses(ctx, requesterID, ids)
+	if err != nil {
+		return nil, err
+	}
+	for i := range resp.Items {
+		liked := statuses[resp.Items[i].ID]
+		resp.Items[i].IsLike = &liked
+	}
+
+	// 只在确实还有下一页时给游标;到底了就是 nil(见 ListHistoryResp 注释)
+	if hasMore {
+		last := resp.Items[len(resp.Items)-1]
+		resp.NextCursor = &HistoryCursor{WatchedAt: last.WatchedAt.UnixMicro(), VideoID: last.ID}
+	}
+	return resp, nil
+}
+
 // toVideoResp 把 entity 转成对外视图,不暴露 DeletedAt 与 Popularity
 func toVideoResp(v *Video) *VideoResp {
 	if v == nil {

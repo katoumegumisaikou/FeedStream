@@ -45,6 +45,50 @@ type VideoResp struct {
 	IsLike       *bool     `json:"is_like,omitempty"` // nil 表示匿名或未计算
 }
 
+// ListHistoryReq 观看历史查询参数(GET /videos/history)。
+//
+// 游标是复合的 (watched_at, video_id):只带时间戳的话,同一时刻的两条没有确定顺序,
+// 翻页会漏条或重复。带上 video_id 兜底,边界就从「某个时刻」变成「某条记录之前」。
+//
+// 时间用微秒,和 play_records.created_at(TIMESTAMP,微秒精度)齐平 —— 必须能精确
+// 还原库里的值,否则 video_id 那个兜底条件的等号永远不成立,等于没加
+type ListHistoryReq struct {
+	// Limit 每页条数。0 由 service 补默认值;max=100 卡住「一次拉全表」
+	Limit int `form:"limit" binding:"omitempty,min=1,max=100"`
+	// CursorWatchedAt 上一页最后一条的 watched_at(Unix 微秒)。首页不传
+	CursorWatchedAt *int64 `form:"cursor_watched_at" binding:"omitempty,min=0"`
+	// CursorVideoID 上一页最后一条的视频 ID。首页不传;必须和 CursorWatchedAt 同时给
+	CursorVideoID *int64 `form:"cursor_video_id" binding:"omitempty,min=1"`
+}
+
+// HistoryItem 观看历史里的一条:视频卡片 + 最近一次观看的进度。
+//
+// 内嵌 VideoResp 而不是再抄一遍字段 —— 前端拿到的就是它已经熟悉的卡片结构,
+// 进度字段平铺在同一层,拼进度条不用往嵌套里翻
+type HistoryItem struct {
+	VideoResp
+	Watched   int       `json:"watched"`    // 看到第几秒
+	Duration  int       `json:"duration"`   // 视频总长,和 watched 一起算进度
+	WatchedAt time.Time `json:"watched_at"` // 最近一次观看时间
+}
+
+// HistoryCursor 观看历史的下一页游标。
+//
+// 两个字段必须一起带回来:只带 watched_at 的话,同一微秒的两条会漏或重复
+type HistoryCursor struct {
+	WatchedAt int64 `json:"watched_at"` // Unix 微秒
+	VideoID   int64 `json:"video_id"`
+}
+
+// ListHistoryResp 观看历史响应。和最新流一样不带 has_more:next_cursor 为 null 即到底
+type ListHistoryResp struct {
+	// Items 视频卡片,按最近观看时间倒序。service 保证非 nil(空页返回 [] 而不是 null)
+	Items []HistoryItem `json:"items"`
+	// NextCursor 下一页游标。只在确实还有下一页时才给,到底了是 null ——
+	// 前端可以直接拿它决定「加载更多」显不显示
+	NextCursor *HistoryCursor `json:"next_cursor,omitempty"`
+}
+
 type InitChunkUploadRequest struct {
 	// max=255 对齐 videos.title 的 VARCHAR(255)(该值会当草稿标题写进库):不在这拦住,
 	// 用户传完 1GB 才会在建视频行时撞上「value too long」。varchar 与 validator 的 max 都按 rune 计数

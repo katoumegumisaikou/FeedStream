@@ -204,3 +204,20 @@ func (v *VideoHandler) ReportPlay(c *gin.Context) {
 	}
 	response.OK(c, nil)
 }
+
+// ListHistory 观看历史。只给当前登录用户看自己的 —— 路由上挂了 SetSensitive,
+// 没 token 在中间件就被拦成 401,走不到这里
+func (v *VideoHandler) ListHistory(c *gin.Context) {
+	var req ListHistoryReq
+	if err := c.ShouldBindQuery(&req); err != nil {
+		response.Error(c, errs.ErrInvalidParam.WithMsg("查询参数无效"))
+		return
+	}
+
+	resp, err := v.svc.ListHistory(c.Request.Context(), middleware.UserID(c), req)
+	if err != nil {
+		response.Error(c, err)
+		return
+	}
+	response.OK(c, resp)
+}
